@@ -282,5 +282,5 @@ If you ever need to configure it, you can do so from your smartphone. All achiev
 
 ## Similar Projects
 
-- **RA2SNES**: [https://github.com/Factor-64/RA2Snes](https://github.com/Factor-64/RA2Snes) - RA2Snes is a program built using Qt 6.7.3 in C++ and C that bridges the QUsb2Snes webserver & rcheevos client to allow unlocking Achievements on real Super Nintendo Hardware through the SD2Snes USB port.
+- **RA2SNES**: [https://github.com/Factor-64/RA2Snes](https://github.com/Factor-64/RA2Snes) - RA2Snes is a program built using Qt 6.7.3 in C++ and C that bridges the QUsb2Snes webserver & rcheevos client to allow unlocking Achievements on real Super Nintendo Hardware through the SD2Snes USB port. See [RA2Snes Achievement Detection Analysis](docs/RA2Snes-Achievement-Detection-Analysis.md) for analysis of timed achievement issues and potential fixes.
 
