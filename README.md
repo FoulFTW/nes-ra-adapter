@@ -16,5 +16,7 @@ Everdrive N8 Pro → PC → ESP32 adapter bridge. Connect Everdrive to PC, send 
 
 - `everdrive_bridge_gui.py` — main app
 - `nes-esp-firmware/` — ESP32 firmware
+- `nes-pico-firmware/` — Raspberry Pi Pico firmware (CRC, rcheevos)
 - `misc/webapp/` — web monitor
 - `misc/achievement_alert.html` — achievement popup template
+- `UPDATE_NOTES.md` — v0.55 changelog and update instructions
