@@ -49,6 +49,9 @@ target_include_directories(${NAME} PRIVATE
 add_compile_definitions(RC_DISABLE_LUA=1)
 add_compile_definitions(RC_NO_THREADS=1)
 
+# rcheevos has type mismatches (unsigned*/uint32_t*, int*/int32_t*) with strict GCC 15
+target_compile_options(${NAME} PRIVATE -Wno-incompatible-pointer-types -Wno-div-by-zero)
+
 # Pull in our pico_stdlib which pulls in commonly used features
 target_link_libraries(${NAME} pico_stdlib pico_stdlib hardware_pio pico_multicore hardware_dma hardware_i2c hardware_spi hardware_adc) 
 

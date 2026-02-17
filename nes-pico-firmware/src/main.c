@@ -332,8 +332,21 @@ FIFO_t achievements_fifo;
 // state for the state machine
 uint8_t state = 0;
 
-// do we detected a NES reset after connect the BUS between NES and Cartridge?
-int nes_reseted = 0;
+// NES reset detection (best-effort).
+// Previously this only fired once (nes_reseted flag). For Everdrive security we need to report RESET events repeatedly.
+// We infer a "RESET" when bus activity resumes after a noticeable gap.
+static uint64_t last_bus_activity_us = 0;
+static uint64_t last_reset_report_us = 0;
+
+// Tuning: gap between observed writes that implies "reset / bus off / restart"
+// Note: many users tap RESET quickly; keep this relatively low, but also gate on a "boot-like" write.
+#ifndef NES_RESET_GAP_US
+#define NES_RESET_GAP_US 50000ULL   // 50ms
+#endif
+// Debounce so we don't spam resets if the bus is noisy
+#ifndef NES_RESET_DEBOUNCE_US
+#define NES_RESET_DEBOUNCE_US 1500000ULL // 1.5s
+#endif
 
 // how many requests are in flight
 uint8_t request_ongoing = 0;
@@ -1316,10 +1329,17 @@ int main()
             {
                 memory_unit memory = read_from_memory_buffer();
 
-                // we started writing on memory ram - so we can assume user reseted the NES and the game is being played
-                if (nes_reseted == 0 && memory.address < 0x07FF)
+                // Detect reset-like events repeatedly: first write after a long gap.
+                // This supports multiple RESETs during Everdrive gameplay.
+                if (last_bus_activity_us == 0)
+                    last_bus_activity_us = now;
+                uint64_t gap = now - last_bus_activity_us;
+                // Gate: only treat as RESET if the first write after the gap is to internal RAM
+                // (boot/init tends to touch RAM immediately; reduces false positives during gameplay stalls).
+                if (gap >= NES_RESET_GAP_US && memory.address < 0x0800 &&
+                    (now - last_reset_report_us) >= NES_RESET_DEBOUNCE_US)
                 {
-                    nes_reseted = 1;
+                    last_reset_report_us = now;
                     uart_puts(UART_ID, "NES_RESETED\r\n");
 
                     // for debug - print the memory addresses we are monitoring after the reset is detected
@@ -1329,6 +1349,7 @@ int main()
                     }
                     printf("\n");
                 }
+                last_bus_activity_us = now;
                 
                 // if memory address is 0x4014, we can assume a frame is being processed
                 if (memory.address == 0x4014)
@@ -1507,7 +1528,6 @@ int main()
                 else if (prefix("CRC_FOUND_MD5", command))
                 {
                     // handle the MD5 found by the ESP32 using the CRC we sent
-                    // we will use it to identify the game in rcheevos
                     printf("L:CRC_FOUND_MD5\n");
                     char *md5_ptr = command + 14;
                     strncpy(md5, md5_ptr, 32);

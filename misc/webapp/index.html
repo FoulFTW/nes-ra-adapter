@@ -115,6 +115,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
+            gap: 1em;
         }
 
         .connected {
@@ -125,6 +126,24 @@
         .disconnected {
             color: white;
             background-color: #FF4C4C;
+        }
+
+        .everdrive-online { color: #4CFF4C; }
+        .everdrive-offline { color: #FF4C4C; }
+        .everdrive-unknown { color: #888; }
+
+        #monitor-btn {
+            position: fixed;
+            top: 2vh;
+            right: 2vw;
+            z-index: 1001;
+            padding: 0.5em 1em;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            border: 2px solid #4287f5;
+            border-radius: 0.5em;
+            cursor: pointer;
+            font-size: 2vh;
         }
 
         .hidden {
@@ -234,6 +253,9 @@
         let game_image = null;
         let heartbeat = null;
         let is_alive = true;
+        let everdrive_connected = null;
+        let bridge_status_interval = null;
+        let bridge_ok_logged = false;
         let img_prefix = "https://media.retroachievements.org/Images/";
         let user_name = null;
         let user_token = null;
@@ -394,10 +416,51 @@
             remove_challenge_imgs();
             hide_progress_achiev();
             is_connected = false;
+            // Keep bridge status poll running (don't clear) - shows bridge even when ESP disconnected
             document.getElementById("statusBar").classList.remove("connected");
             document.getElementById("statusBar").classList.add("disconnected");
-            document.getElementById("statusBar").innerText = "Status: Disconnected";
+            document.getElementById("statusBar").innerHTML = "ESP: Disconnected | <span id=\"everdriveStatus\" class=\"everdrive-unknown\">Bridge: —</span>";
             show_game_info("", `${img_prefix}046636.png`);
+        }
+
+        function update_everdrive_status(connected) {
+            everdrive_connected = connected;
+            const el = document.getElementById("everdriveStatus");
+            if (!el) return;
+            el.className = connected === true ? "everdrive-online" : (connected === false ? "everdrive-offline" : "everdrive-unknown");
+            el.textContent = connected === true ? "Bridge: OK | Everdrive: Online" : (connected === false ? "Bridge: OK | Everdrive: Offline" : "Bridge: —");
+        }
+
+        const BRIDGE_URLS = [
+            "http://localhost:8080/status",
+            "http://everdrive-bridge.local:8080/status",
+            "http://127.0.0.1:8080/status"
+        ];
+
+        async function fetch_bridge_status() {
+            let lastErr = null;
+            for (const url of BRIDGE_URLS) {
+                try {
+                    const r = await fetch(url);
+                    if (r.ok) {
+                        const j = await r.json();
+                        update_everdrive_status(j.everdrive_connected);
+                        if (!bridge_ok_logged) { log("Bridge connected: " + url); bridge_ok_logged = true; }
+                        return;
+                    }
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            update_everdrive_status(null);
+            bridge_ok_logged = false;
+            if (lastErr) log("Bridge fetch failed: " + lastErr.message);
+        }
+
+        function start_bridge_status_poll() {
+            if (bridge_status_interval) clearInterval(bridge_status_interval);
+            fetch_bridge_status();
+            bridge_status_interval = setInterval(fetch_bridge_status, 5000);
         }
         function connect() {
             log("⚠️conn begin");
@@ -407,7 +470,8 @@
                 is_connected = true;
                 document.getElementById("statusBar").classList.remove("disconnected");
                 document.getElementById("statusBar").classList.add("connected");
-                document.getElementById("statusBar").innerText = "Status: Connected";
+                document.getElementById("statusBar").innerHTML = "ESP: Connected | <span id=\"everdriveStatus\" class=\"everdrive-unknown\">Bridge: —</span>";
+                start_bridge_status_poll();
                 is_alive = true;
                 if (heartbeat) {
                     clearInterval(heartbeat);
@@ -507,6 +571,89 @@
 
         }
 
+        function open_monitor_window() {
+            const w = window.open("", "nes_ra_monitor", "width=600,height=500,scrollbars=yes");
+            if (!w) return;
+            w.document.write(`
+<!DOCTYPE html><html><head><title>NES RA Monitor</title>
+<style>body{font-family:monospace;background:#111;color:#0f0;padding:8px;margin:0;}
+pre{white-space:pre-wrap;word-wrap:break-word;font-size:12px;margin:4px 0;}
+.bar{display:flex;gap:1em;margin-bottom:8px;flex-wrap:wrap;}
+.status{font-weight:bold;}
+.online{color:#0f0;} .offline{color:#f00;} .unk{color:#888;}
+.section{font-weight:bold;margin-top:10px;margin-bottom:4px;}
+.device-log{font-size:11px;color:#8f8;max-height:120px;overflow-y:auto;}
+</style></head><body>
+<div class="bar">
+  <span class="status">ESP: <span id="espSt">—</span></span>
+  <span class="status">Everdrive: <span id="edSt" class="unk">—</span></span>
+  <span>Bridge server: <span id="brSt" class="unk">—</span> <span id="brNote" class="unk" style="font-size:10px;"></span></span>
+</div>
+<div class="section">Device connection log (from bridge):</div>
+<pre id="deviceLog" class="device-log">(polling...)</pre>
+<div class="section">Messages from ESP:</div>
+<pre id="log"></pre>
+</body></html>`);
+            w.document.close();
+            const logEl = w.document.getElementById("log");
+            const deviceLogEl = w.document.getElementById("deviceLog");
+            const espSt = w.document.getElementById("espSt");
+            const edSt = w.document.getElementById("edSt");
+            const brSt = w.document.getElementById("brSt");
+            const brNote = w.document.getElementById("brNote");
+            let lastBridgeOk = 0;
+            const addLog = (msg) => {
+                const t = new Date().toLocaleTimeString();
+                logEl.textContent += `[${t}] ${msg}\n`;
+                logEl.scrollTop = logEl.scrollHeight;
+            };
+            const ws = new WebSocket("ws://nes-ra-adapter.local/ws");
+            ws.onopen = () => { espSt.textContent = "Connected"; espSt.className = "online"; addLog("WebSocket connected"); };
+            ws.onclose = () => { espSt.textContent = "Disconnected"; espSt.className = "offline"; addLog("WebSocket closed"); };
+            ws.onmessage = (e) => addLog(e.data);
+            ws.onerror = () => addLog("WebSocket error");
+            (async function pollBridge() {
+                const urls = ["http://localhost:8080", "http://everdrive-bridge.local:8080", "http://127.0.0.1:8080"];
+                let ok = false;
+                for (const base of urls) {
+                    try {
+                        const [statusR, logR] = await Promise.all([fetch(base + "/status"), fetch(base + "/log")]);
+                        if (statusR.ok) {
+                            const j = await statusR.json();
+                            brSt.textContent = "OK";
+                            brSt.className = "online";
+                            lastBridgeOk = Date.now();
+                            brNote.textContent = "(this monitor confirms server is up)";
+                            brNote.className = "unk";
+                            edSt.textContent = j.everdrive_connected ? "Online" : "Offline";
+                            edSt.className = j.everdrive_connected ? "online" : "offline";
+                            ok = true;
+                        }
+                        if (logR.ok) {
+                            const logJ = await logR.json();
+                            const entries = logJ.entries || [];
+                            deviceLogEl.textContent = entries.length ? entries.join("\n") : "(no connections yet)";
+                            deviceLogEl.scrollTop = deviceLogEl.scrollHeight;
+                        } else {
+                            deviceLogEl.textContent = "(log unavailable)";
+                        }
+                        if (ok) break;
+                    } catch (e) {}
+                }
+                if (!ok) {
+                    brSt.textContent = "—";
+                    brSt.className = "unk";
+                    brNote.textContent = lastBridgeOk ? "(server down?)" : "(not reachable)";
+                    brNote.className = "offline";
+                    edSt.textContent = "—";
+                    edSt.className = "unk";
+                    deviceLogEl.textContent = "(bridge not reachable)";
+                }
+                if (w.closed) return;
+                setTimeout(pollBridge, 3000);
+            })();
+        }
+
         function keep_connected() {
             if (!is_connected) {
                 // checar se estado do socket está esperando se conectar
@@ -521,6 +668,8 @@
             }, 5000);
         }
         keep_connected();
+        // Start bridge status poll immediately (don't wait for ESP)
+        start_bridge_status_poll();
         // keep the screen on - do not work with http
         // let wakeLock = null;
         // async function requestWakeLock() {
@@ -586,8 +735,9 @@
         By Odelot & GH
     </div>
     <div class="status-bar disconnected" id="statusBar">
-        Status: Disconnected
+        ESP: Disconnected | <span id="everdriveStatus" class="everdrive-unknown">Bridge: —</span>
     </div>
+    <button id="monitor-btn" onclick="open_monitor_window()">Open Monitor</button>
     <div id="p-container" class="hidden"></div>
     <div id="c-container"></div>
     <div id="toast-container"></div>
