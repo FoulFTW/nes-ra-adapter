@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, orientation=landscape">
+    <meta name="screen-orientation" content="landscape">
+    <title>NES RA Adapter Web App</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background-color: #ece037;
+            font-family: sans-serif;
+        }
+
+        .banner {
+            height: 20vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 8vh;
+            font-weight: bold;
+        }
+
+        .content {
+            height: 72vh;
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .box {
+            background-color: #000;
+            border: 2vh solid #4287f5;
+            /* azul */
+            width: 80%;
+            height: 100%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 2vh;
+            border-radius: 2vh;
+        }
+
+        .g-title {
+            height: 30%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 7vh;
+            text-align: center;
+        }
+
+        .g-img {
+            height: 70%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .g-img img {
+
+            max-height: 100%;
+            max-width: 100%;
+            height: 80%;
+            object-fit: contain;
+        }
+
+
+        .a-title,
+        .a-banner {
+            height: 25%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 7vh;
+            text-align: center;
+        }
+
+        .a-img {
+            height: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .a-img img {
+
+            max-height: 100%;
+            max-width: 100%;
+            height: 80%;
+            object-fit: contain;
+        }
+
+        .footer-txt {
+            height: 5vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2vh;
+            font-weight: bold;
+        }
+
+        .status-bar {
+            height: 3vh;
+            font-size: 2vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1em;
+        }
+
+        .connected {
+            background-color: #4CFF4C;
+            color: black;
+        }
+
+        .disconnected {
+            color: white;
+            background-color: #FF4C4C;
+        }
+
+        .everdrive-online { color: #4CFF4C; }
+        .everdrive-offline { color: #FF4C4C; }
+        .everdrive-unknown { color: #888; }
+
+        #monitor-btn {
+            position: fixed;
+            top: 2vh;
+            right: 2vw;
+            z-index: 1001;
+            padding: 0.5em 1em;
+            background: rgba(0,0,0,0.7);
+            color: white;
+            border: 2px solid #4287f5;
+            border-radius: 0.5em;
+            cursor: pointer;
+            font-size: 2vh;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        #c-container {
+            position: fixed;
+            bottom: 2vh;
+            right: 2vw;
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            gap: 1vw;
+            background-color: rgba(0, 0, 0, 0.6);
+            /* opcional, só pra ver onde está */
+            padding: 0.5em;
+            border-radius: 0.5em;
+            z-index: 1000;
+        }
+
+        #c-container img {
+            height: 12vh;
+            object-fit: contain;
+        }
+
+        #p-container {
+            position: fixed;
+            bottom: 17vh;
+            right: 2vw;
+            display: flex;
+            gap: 1vh;
+            background-color: rgba(0, 0, 0, 0.6);
+            padding: 0.5em;
+            border-radius: 0.5em;
+            z-index: 9998;
+            max-width: 90vw;
+            overflow-x: auto;
+            
+        }
+
+        .p-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            color: white;
+            font-size: 2vh;
+            font-weight: bold;
+            
+        }
+
+        .p-item span {
+            margin-top: 0.5vh;
+        }
+
+        .p-item img {
+            height: 12vh;;
+            border-radius: 8px;
+        }
+
+        #toast-container {
+            position: fixed;
+            bottom: 5vh;
+            left: 50%;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 1vh;
+            align-items: center;
+        }
+
+        .toast {
+            background-color: rgba(0, 0, 0, 0.85);
+            color: white;
+            padding: 1.5vh 3vw;
+            font-size: 2.2vh;
+            border-radius: 2vh;
+            max-width: 80vw;
+            text-align: center;
+            box-shadow: 0 0.5vh 1vh rgba(0, 0, 0, 0.3);
+            animation: fadeInOut 4s ease-in-out forwards;
+        }
+
+        @keyframes fadeInOut {
+            0% {
+                opacity: 0;
+                transform: translateX(-50%) translateY(2vh);
+            }
+
+            10%,
+            90% {
+                opacity: 1;
+                transform: translateX(-50%) translateY(0);
+            }
+
+            100% {
+                opacity: 0;
+                transform: translateX(-50%) translateY(2vh);
+            }
+        }
+    </style>
+    <script>
+        let socket;
+        let is_connected = false;
+        let achievement_timeout = null;
+        let game_name = null;
+        let game_image = null;
+        let heartbeat = null;
+        let is_alive = true;
+        let everdrive_connected = null;
+        let bridge_status_interval = null;
+        let bridge_ok_logged = false;
+        let img_prefix = "https://media.retroachievements.org/Images/";
+        let user_name = null;
+        let user_token = null;
+        let game_session = null;
+        let game_id = null;
+
+        function send_notification(title, body, icon) {
+            // do not work without https and websocket cannot be wss on esp32
+            // try {
+            //     Notification.requestPermission().then(permission => {
+            //         if (permission === 'granted') {
+            //             new Notification(title, {
+            //                 body: body,
+            //                 icon: icon
+            //             });
+            //         }
+            //     });
+            // } catch (error) {
+            //     console.error('notify err:', error);
+            // }
+            try {
+                if (Android) {
+                    Android.notify(title, `${game_name} - ${body}`);
+                }
+            }
+            catch (error) {
+                console.error('Android notify err:', error);
+            }
+        }
+
+        function showToast(message) {
+            const container = document.getElementById("toast-container");
+
+            const toast = document.createElement("div");
+            toast.className = "toast";
+            toast.textContent = message;
+
+            container.appendChild(toast);
+
+            //Remove o toast após 4s
+            setTimeout(() => {
+                toast.remove();
+            }, 4000);
+        }
+
+        function log(msg) {
+            console.log(msg);
+        }
+
+        function show_game_info(game_name, game_image) {
+            // atualizar a imagem e o nome do jogo
+            const imgElement = document.querySelector(".g-img img");
+            const titleElement = document.getElementById("g-title");
+            titleElement.innerText = game_name;
+            imgElement.src = game_image; // aqui você deve colocar a URL correta da imagem
+            document.querySelector(".a-box").classList.add("hidden");
+            document.querySelector(".g-box").classList.remove("hidden");
+        }
+
+        function process_msg(msg, store = true) {
+            if (msg.startsWith("G=")) {
+                const [gameSession, gameId, gameName, imageName] = msg.split(";");
+                game_session = gameSession.split("=")[1];
+                game_name = gameName;
+                game_id = gameId;
+                game_image = `${img_prefix}${imageName}`;
+                show_game_info(game_name, game_image);
+                const last_game_session = localStorage.getItem("game_session");
+                if (last_game_session == game_session) {
+                    // recupera infos do localstorage
+                    let command_list = localStorage.getItem("command_list");
+                    if (command_list == null) {
+                        command_list = "";
+                    }
+                    commands = command_list.split("\r\n");
+                    commands.forEach(element => {
+                        if (element == "") return;
+                        process_msg(element, false);
+                    });
+                } else {
+                    localStorage.clear();
+                }
+
+                localStorage.setItem("game_session", game_session);
+
+            } else if (msg.startsWith("A=")) {
+                // decodificar msg com informações do achievment - exemplo: A=123456;Cruise Control;https://media.retroachievements.org/Badge/348421.png
+                // separar o nome do achievment e a imagem
+                const [achievementId, achievementName, imageName] = msg.split(";");
+                // atualizar a imagem e o nome do achievment
+                show_achievement_info(achievementName, imageName);
+            } else if (msg === "pong") {
+                is_alive = true;
+            } else if (msg.startsWith("C=")) {
+                if (store) {
+                    let command_list = localStorage.getItem("command_list", "");
+                    if (command_list == null) {
+                        command_list = "";
+                    }
+                    command_list += msg;
+                    localStorage.setItem("command_list", command_list);
+                }
+                msg = msg.replace("\r\n", ""); // remove o \r\n do final da string
+                let [comm_action, c_id, c_title, c_url] = msg.split(";");
+                const action = comm_action.split("=")[1];
+                if (action == "S") {
+                    c_url = c_url.replace("_lock", "");
+                    // adicionar a imagem do achievement
+                    add_challenge_img(c_id, c_title, c_url);
+                } else if (action == "H") {
+                    // remover a imagem do achievement
+                    if (c_id != 0)
+                        remove_challenge_img(c_id);
+                }
+            } else if (msg.startsWith("P=")) {
+                msg = msg.replace("\r\n", ""); // remove o \r\n do final da string
+                const [comm_action, c_id, c_title, c_url, progress] = msg.split(";");
+                const action = comm_action.split("=")[1];
+                if (action == "S") {
+                    // adicionar a imagem do achievement
+                    add_progress_achiev(c_id, c_url, c_title, progress);
+                } else if (action == "H") {
+                    hide_progress_achiev();
+                }
+            }
+            else if (msg.startsWith("RESET")) {
+                localStorage.clear();
+            } else {
+                log("❓: " + msg);
+            }
+        }
+
+        function show_achievement_info(achievement_name, image_name) {
+            const imgElement = document.querySelector(".a-img img");
+            const titleElement = document.getElementById("a-title");
+            const bannerElement = document.getElementById("a-banner");
+            titleElement.innerText = achievement_name;
+            imgElement.src = image_name;
+            // mostrar a div de achievement
+            document.querySelector(".g-box").classList.add("hidden");
+            document.querySelector(".a-box").classList.remove("hidden");
+            // tocar a mp3 achievement.mp3
+            const audio = new Audio("snd.mp3");
+            audio.play();
+            // vibrar o celular
+            navigator.vibrate(200);
+            // mostrar a notificação
+            send_notification("New Achievement Unlocked", achievement_name, image_name);
+            if (achievement_timeout != null) {
+                clearTimeout(achievement_timeout);
+            }
+            achievement_timeout = setTimeout(() => {
+                show_game_info(game_name, game_image);
+                achievement_timeout = null;
+            }, 15000);
+        }
+        function reset_screen() {
+            remove_challenge_imgs();
+            hide_progress_achiev();
+            is_connected = false;
+            // Keep bridge status poll running (don't clear) - shows bridge even when ESP disconnected
+            document.getElementById("statusBar").classList.remove("connected");
+            document.getElementById("statusBar").classList.add("disconnected");
+            document.getElementById("statusBar").innerHTML = "ESP: Disconnected | <span id=\"everdriveStatus\" class=\"everdrive-unknown\">Bridge: —</span>";
+            show_game_info("", `${img_prefix}046636.png`);
+        }
+
+        function update_everdrive_status(connected) {
+            everdrive_connected = connected;
+            const el = document.getElementById("everdriveStatus");
+            if (!el) return;
+            el.className = connected === true ? "everdrive-online" : (connected === false ? "everdrive-offline" : "everdrive-unknown");
+            el.textContent = connected === true ? "Bridge: OK | Everdrive: Online" : (connected === false ? "Bridge: OK | Everdrive: Offline" : "Bridge: —");
+        }
+
+        const BRIDGE_URLS = [
+            "http://localhost:8080/status",
+            "http://everdrive-bridge.local:8080/status",
+            "http://127.0.0.1:8080/status"
+        ];
+
+        async function fetch_bridge_status() {
+            let lastErr = null;
+            for (const url of BRIDGE_URLS) {
+                try {
+                    const r = await fetch(url);
+                    if (r.ok) {
+                        const j = await r.json();
+                        update_everdrive_status(j.everdrive_connected);
+                        if (!bridge_ok_logged) { log("Bridge connected: " + url); bridge_ok_logged = true; }
+                        return;
+                    }
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            update_everdrive_status(null);
+            bridge_ok_logged = false;
+            if (lastErr) log("Bridge fetch failed: " + lastErr.message);
+        }
+
+        function start_bridge_status_poll() {
+            if (bridge_status_interval) clearInterval(bridge_status_interval);
+            fetch_bridge_status();
+            bridge_status_interval = setInterval(fetch_bridge_status, 5000);
+        }
+        function connect() {
+            log("⚠️conn begin");
+            socket = new WebSocket(`ws://nes-ra-adapter.local/ws`);
+            socket.onopen = () => {
+                log("✅ connected");
+                is_connected = true;
+                document.getElementById("statusBar").classList.remove("disconnected");
+                document.getElementById("statusBar").classList.add("connected");
+                document.getElementById("statusBar").innerHTML = "ESP: Connected | <span id=\"everdriveStatus\" class=\"everdrive-unknown\">Bridge: —</span>";
+                start_bridge_status_poll();
+                is_alive = true;
+                if (heartbeat) {
+                    clearInterval(heartbeat);
+                }
+                heartbeat = setInterval(() => {
+                    log("💓");
+                    if (!is_alive) {
+                        console.warn("ws died");
+                        reset_screen();
+                        socket.close();
+                        clearInterval(heartbeat);
+                    } else {
+                        is_alive = false;
+                        socket.send("ping");
+                    }
+
+                }, 10000);
+
+            }
+            socket.onmessage = (event) => {
+                log("📩:" + event.data);
+                process_msg(event.data);
+            }
+            socket.onclose = () => {
+                log("🔌 conn end")
+                reset_screen();
+
+            };
+            socket.onerror = (err) => {
+                log("❌: " + err);
+            }
+        }
+
+        function add_challenge_img(id, title, src) {
+
+            if (document.getElementById('c-' + id)) return;
+
+            const container = document.getElementById('c-container');
+            const img = document.createElement('img');
+            img.src = src;
+            img.alt = title;
+            img.title = title;
+            img.onclick = function () {
+                console.log(this);
+                showToast(this.title);
+            };
+            img.id = 'c-' + id;  // usar o id do achievement
+            container.appendChild(img);
+        }
+
+        function remove_challenge_img(id) {
+            id = id.trim();
+            const img = document.getElementById('c-' + id);
+            if (img && img.parentNode) {
+                img.parentNode.removeChild(img);
+            }
+        }
+
+        function remove_challenge_imgs() {
+            const container = document.getElementById('c-container');
+            const items = container.querySelectorAll("img");
+            items.forEach(item => {
+                item.remove();
+            });
+        }
+
+        function add_progress_achiev(id, imageUrl, title, progress) {
+            const container = document.getElementById("p-container");
+            const items = container.querySelectorAll(".p-item");
+            items.forEach(item => {
+                item.remove();
+            });
+            container.classList.remove("hidden");
+
+            const item = document.createElement("div");
+            item.className = "p-item";
+            item.id = `p-${id}`;
+
+            const img = document.createElement("img");
+            img.src = imageUrl;
+
+            const text = document.createElement("span");
+            text.textContent = progress;
+
+            item.appendChild(img);
+            item.appendChild(text);
+            container.appendChild(item);
+        }
+
+        function hide_progress_achiev () {
+            const container = document.getElementById("p-container");
+            container.classList.add("hidden");
+            const items = container.querySelectorAll(".p-item");
+            items.forEach(item => {
+                item.remove();
+            });
+
+        }
+
+        function open_monitor_window() {
+            const w = window.open("", "nes_ra_monitor", "width=600,height=500,scrollbars=yes");
+            if (!w) return;
+            w.document.write(`
+<!DOCTYPE html><html><head><title>NES RA Monitor</title>
+<style>body{font-family:monospace;background:#111;color:#0f0;padding:8px;margin:0;}
+pre{white-space:pre-wrap;word-wrap:break-word;font-size:12px;margin:4px 0;}
+.bar{display:flex;gap:1em;margin-bottom:8px;flex-wrap:wrap;}
+.status{font-weight:bold;}
+.online{color:#0f0;} .offline{color:#f00;} .unk{color:#888;}
+.section{font-weight:bold;margin-top:10px;margin-bottom:4px;}
+.device-log{font-size:11px;color:#8f8;max-height:120px;overflow-y:auto;}
+</style></head><body>
+<div class="bar">
+  <span class="status">ESP: <span id="espSt">—</span></span>
+  <span class="status">Everdrive: <span id="edSt" class="unk">—</span></span>
+  <span>Bridge server: <span id="brSt" class="unk">—</span> <span id="brNote" class="unk" style="font-size:10px;"></span></span>
+</div>
+<div class="section">Device connection log (from bridge):</div>
+<pre id="deviceLog" class="device-log">(polling...)</pre>
+<div class="section">Messages from ESP:</div>
+<pre id="log"></pre>
+</body></html>`);
+            w.document.close();
+            const logEl = w.document.getElementById("log");
+            const deviceLogEl = w.document.getElementById("deviceLog");
+            const espSt = w.document.getElementById("espSt");
+            const edSt = w.document.getElementById("edSt");
+            const brSt = w.document.getElementById("brSt");
+            const brNote = w.document.getElementById("brNote");
+            let lastBridgeOk = 0;
+            const addLog = (msg) => {
+                const t = new Date().toLocaleTimeString();
+                logEl.textContent += `[${t}] ${msg}\n`;
+                logEl.scrollTop = logEl.scrollHeight;
+            };
+            const ws = new WebSocket("ws://nes-ra-adapter.local/ws");
+            ws.onopen = () => { espSt.textContent = "Connected"; espSt.className = "online"; addLog("WebSocket connected"); };
+            ws.onclose = () => { espSt.textContent = "Disconnected"; espSt.className = "offline"; addLog("WebSocket closed"); };
+            ws.onmessage = (e) => addLog(e.data);
+            ws.onerror = () => addLog("WebSocket error");
+            (async function pollBridge() {
+                const urls = ["http://localhost:8080", "http://everdrive-bridge.local:8080", "http://127.0.0.1:8080"];
+                let ok = false;
+                for (const base of urls) {
+                    try {
+                        const [statusR, logR] = await Promise.all([fetch(base + "/status"), fetch(base + "/log")]);
+                        if (statusR.ok) {
+                            const j = await statusR.json();
+                            brSt.textContent = "OK";
+                            brSt.className = "online";
+                            lastBridgeOk = Date.now();
+                            brNote.textContent = "(this monitor confirms server is up)";
+                            brNote.className = "unk";
+                            edSt.textContent = j.everdrive_connected ? "Online" : "Offline";
+                            edSt.className = j.everdrive_connected ? "online" : "offline";
+                            ok = true;
+                        }
+                        if (logR.ok) {
+                            const logJ = await logR.json();
+                            const entries = logJ.entries || [];
+                            deviceLogEl.textContent = entries.length ? entries.join("\n") : "(no connections yet)";
+                            deviceLogEl.scrollTop = deviceLogEl.scrollHeight;
+                        } else {
+                            deviceLogEl.textContent = "(log unavailable)";
+                        }
+                        if (ok) break;
+                    } catch (e) {}
+                }
+                if (!ok) {
+                    brSt.textContent = "—";
+                    brSt.className = "unk";
+                    brNote.textContent = lastBridgeOk ? "(server down?)" : "(not reachable)";
+                    brNote.className = "offline";
+                    edSt.textContent = "—";
+                    edSt.className = "unk";
+                    deviceLogEl.textContent = "(bridge not reachable)";
+                }
+                if (w.closed) return;
+                setTimeout(pollBridge, 3000);
+            })();
+        }
+
+        function keep_connected() {
+            if (!is_connected) {
+                // checar se estado do socket está esperando se conectar
+                if (socket && socket.readyState === WebSocket.CONNECTING) {
+                    log("🔄 try conn");
+                } else {
+                    connect();
+                }
+            }
+            setTimeout(() => {
+                keep_connected();
+            }, 5000);
+        }
+        keep_connected();
+        // Start bridge status poll immediately (don't wait for ESP)
+        start_bridge_status_poll();
+        // keep the screen on - do not work with http
+        // let wakeLock = null;
+        // async function requestWakeLock() {
+        //     try {
+        //         wakeLock = await navigator.wakeLock.request("screen");
+        //         // console.log("Wake lock ativado");
+
+        //         // Reativa se perder o foco
+        //         if (wakeLock != null) {
+        //             wakeLock.addEventListener("release", () => {
+        //                 // console.log("Wake lock liberado");
+        //             });
+        //         }
+
+        //     } catch (err) {
+        //         console.error(`${err.name}, ${err.message}`);
+        //     }
+        // }
+        // document.addEventListener("click", requestWakeLock);
+
+        // works with http
+        function enterFullscreen() {
+            const el = document.documentElement;
+            if (el.requestFullscreen) {
+                el.requestFullscreen();
+            } else if (el.webkitRequestFullscreen) { // Safari
+                el.webkitRequestFullscreen();
+            } else if (el.msRequestFullscreen) { // IE
+                el.msRequestFullscreen();
+            }
+        }
+        // for webview
+        document.addEventListener("click", enterFullscreen);
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js')
+                .then(reg => console.log("SW ok:", reg.scope))
+                .catch(err => console.error("err service worker:", err));
+        }
+    </script>
+</head>
+
+<body>
+    <div class="banner">
+        NES RetroAchievements Adapter
+    </div>
+
+    <div class="content">
+        <div class="box g-box">
+            <div class="g-title" id="g-title"></div>
+            <div class="g-img">
+                <img src="https://media.retroachievements.org/Images/046636.png">
+            </div>
+        </div>
+        <div class="box a-box hidden">
+            <div class="a-banner" id="a-banner">New Achievement Unlocked</div>
+            <div class="a-img">
+                <img src="https://media.retroachievements.org/Images/046636.png">
+            </div>
+            <div class="a-title" id="a-title"></div>
+        </div>
+    </div>
+    <div class="footer-txt">
+        By Odelot & GH
+    </div>
+    <div class="status-bar disconnected" id="statusBar">
+        ESP: Disconnected | <span id="everdriveStatus" class="everdrive-unknown">Bridge: —</span>
+    </div>
+    <button id="monitor-btn" onclick="open_monitor_window()">Open Monitor</button>
+    <div id="p-container" class="hidden"></div>
+    <div id="c-container"></div>
+    <div id="toast-container"></div>
+    
+</body>
+
+</html>

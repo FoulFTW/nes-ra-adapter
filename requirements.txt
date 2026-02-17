@@ -1,0 +1,5 @@
+# NES RA Adapter Bridge - Python dependencies
+pyserial>=3.5
+pywebview>=4.0
+# pygame>=2.0  # Optional: for achievement sound volume control and MP3 support
+pygame>=2.0
