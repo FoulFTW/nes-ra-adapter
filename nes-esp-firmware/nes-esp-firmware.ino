@@ -78,6 +78,7 @@
 
 #include <WiFiManager.h>
 #include <EEPROM.h>
+#include <Update.h>
 
 #include <StreamString.h>
 #include <WiFi.h>
@@ -207,12 +208,63 @@ typedef enum HttpRequestResult
   HTTP_ERR_REPONSE_TOO_BIG = -5,
 };
 
+// Everdrive bridge WiFi poll - ESP32 fetches game from bridge over HTTP
+// Your PC IP (run ipconfig to check; change if your IP changes)
+#define EVERDRIVE_BRIDGE_HOST "192.168.0.189"
+#define EVERDRIVE_BRIDGE_PORT 8080
+#define EVERDRIVE_BRIDGE_POLL_INTERVAL_MS 2500
+#define EVERDRIVE_BRIDGE_STATUS_POLL_MS 4000   // Poll /status every 4s (was 2s) - less blocking so REQ=/A= get processed promptly
+#define EVERDRIVE_DISCONNECT_GRACE_MS 5000    // 5s grace after game load before disconnect polling (was 30s)
+// Everdrive anti-cheat timing
+#define EVERDRIVE_LOCKOUT_AFTER_MS 25000      // Lockout if bridge/everdrive offline this long (continuous)
+// Keep status polling fast/non-blocking to avoid false lockouts when ESP is busy
+#define EVERDRIVE_BRIDGE_CONNECT_TIMEOUT_MS 3000
+#define EVERDRIVE_BRIDGE_STATUS_READ_TIMEOUT_MS 2000
+
+// Everdrive: game-change detection (bridge reports active_crc in /status).
+// 0 = detect+log only (start small), 1 = enforce by entering security lockout (bus off).
+#ifndef EVERDRIVE_ENFORCE_GAME_CHANGE_LOCKOUT
+#define EVERDRIVE_ENFORCE_GAME_CHANGE_LOCKOUT 0
+#endif
+
+// Everdrive: reset-based security.
+// Many resets happen during the normal Everdrive boot flow. Also, early crashes/resets can occur right after gameplay starts.
+// Only enforce "RESET requires re-submit" after this much gameplay time has elapsed.
+#ifndef EVERDRIVE_RESET_SECURITY_AFTER_MS
+#define EVERDRIVE_RESET_SECURITY_AFTER_MS 120000UL  // 2 minutes
+#endif
+
+// Everdrive: if too many RESETs occur during gameplay, force a full re-handshake (Pico reboot + re-submit).
+#ifndef EVERDRIVE_RESET_RELOGIN_THRESHOLD
+#define EVERDRIVE_RESET_RELOGIN_THRESHOLD 6
+#endif
+
+// OTA firmware update
+#define OTA_UPDATE_HOST "everdrive-bridge.local"
+#define OTA_UPDATE_PORT 8081
+#define OTA_UPDATE_STATUS_PATH "/update-status"
+#define OTA_UPDATE_FIRMWARE_PATH "/firmware.bin"
+#define OTA_UPDATE_TIMEOUT_MS 8000
+
+// Everdrive CRC identifiers (from cartridge detection table) - all trigger Everdrive mode
+static const struct { const char begin[9]; const char end[9]; } EVERDRIVE_CRCS[] = {
+  {"81C44578", "229C42BA"},  // Everdrive N8 Pro (common)
+  {"81C44578", "F33A1998"},  // Everdrive N8 Pro (game loaded / alternate state)
+  {"FDC6DC13", "FDC6DC13"},  // Everdrive menu (both same)
+  {"15B13D1C", "F2C82318"},  // Everdrive N8 (first boot)
+  {"15B13D1C", "7827933D"},  // Everdrive N8
+  {"15B13D1C", "D747C748"},  // Everdrive N8
+};
+#define EVERDRIVE_CRCS_COUNT (sizeof(EVERDRIVE_CRCS) / sizeof(EVERDRIVE_CRCS[0]))
+
 // Device state machine states
 typedef enum DeviceState {
-  STATE_IDENTIFY_CARTRIDGE = 0,
-  STATE_WAITING_CRC = 1,
-  STATE_CRC_FOUND = 2,
-  STATE_WATCHING = 3,
+  STATE_IDENTIFY_CARTRIDGE = 1,
+  STATE_WAITING_CRC = 2,
+  STATE_CRC_FOUND = 3,
+  STATE_WATCHING = 4,
+  STATE_EVERDRIVE_WAIT_GAME = 5,  // Everdrive N8 Pro: bus open, waiting for SELECT_GAME from bridge
+  STATE_SECURITY_LOCKOUT = 6,     // Everdrive: bridge/ESP disconnected 15s - bus off, ignore Pico
   STATE_IDLE = 128,
   STATE_ERROR_CONNECTIVITY = 198,
   STATE_ERROR_RESPONSE_TOO_BIG = 199,
@@ -293,7 +345,15 @@ bool fifo_is_full(achievements_FIFO_t *fifo);
 bool fifo_enqueue(achievements_FIFO_t *fifo, achievements_t value);
 bool fifo_dequeue(achievements_FIFO_t *fifo, achievements_t *value);
 void show_achievement(achievements_t achievement);
+#ifdef ENABLE_LCD
+void clear_game_display_for_disconnect(void);
+#endif
+int perform_http_request_buffer(const char* url, HttpRequestMethod method, const char* payload, size_t payload_len, CharBufferStream &resp, bool isIdempotent, int maxRetries, int timeoutMs, int retryDelayMs);
 
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+void handleLittleFSUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final);
+void handleOTAUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final);
+#endif
 
 // global variables for LED control
 Led ledRed   = {LED_STATUS_RED_PIN, LED_OFF, false, Ticker()};
@@ -343,14 +403,20 @@ uint16_t unlocked_achievements = 0;
 // global variables for storing states, timestamps and useful information
 String ra_user_token;
 
-// Buffer fixo para comunicação serial com o Pico (evita fragmentação de memória)
-// Reduzido para economizar RAM - comandos típicos são < 512 bytes
+// Buffer fixo para comunica├º├úo serial com o Pico (evita fragmenta├º├úo de mem├│ria)
+// Reduzido para economizar RAM - comandos t├¡picos s├úo < 512 bytes
 #define SERIAL_BUFFER_SIZE 768
 char serial_buffer[SERIAL_BUFFER_SIZE];
 size_t serial_buffer_len = 0;
 
+// Buffer for SELECT_GAME from Everdrive bridge (USB Serial)
+#define SERIAL_USB_BUFFER_SIZE 64
+char serial_usb_buffer[SERIAL_USB_BUFFER_SIZE];
+size_t serial_usb_buffer_len = 0;
+
 // Flexible buffer for large HTTP responses 
 #define LARGE_BUFFER_SIZE 102400 // 100 KB 
+#define MAX_RESPONSE_BUFFER_SIZE 180000 // 180 KB - max for RA patch (dynamic grow when needed)
 #define SMALL_BUFFER_SIZE 10240 // 10 KB
 CharBufferStream response;
 // HTTP client global to reuse SSL buffers (avoids fragmentation)
@@ -366,8 +432,34 @@ String game_image;
 String game_id;
 String game_session;
 bool go_back_to_title_screen = false;
+bool everdrive_mode = false;  // True when game came from bridge
 bool already_showed_title_screen = false;
+bool nes_reseted_handled_this_session = false;  // Only process NES_RESETED once per power cycle
+bool everdrive_game_received_this_session = false;  // Once true, never show "1.RESET now" again until reboot
+bool security_lockout_active = false;  // Everdrive: bridge/ESP disconnected 15s - bus off, ignore Pico
+bool everdrive_pending_game_found_screen = false;  // Everdrive: show Game Found screen when GAME_INFO arrives
+bool everdrive_security_armed = false;  // Everdrive: start anti-cheat watchdog only after RESET into gameplay
+bool everdrive_bridge_trusted = false;  // Everdrive: we only arm/advance after status OK (connected + cheats_ok)
+unsigned long everdrive_last_good_ms = 0; // Everdrive: last time /status was OK (connected + cheats_ok)
+// Everdrive: if RA connectivity is failing, pause bridge polling briefly to reduce network contention.
+// NOTE: while paused, we also "pause" the lockout timer so we don't immediately lock out after resuming.
+unsigned long everdrive_pause_bridge_poll_until_ms = 0;
+// Everdrive: expected game CRC pair (from bridge submit) and active CRC pair reported by bridge /status.
+char everdrive_expected_crc_pair[20] = {0};   // "XXXXXXXX,YYYYYYYY"
+char bridge_active_crc_pair[20] = {0};        // "XXXXXXXX,YYYYYYYY"
+bool bridge_active_crc_in_menu = false;
+// Everdrive: when gameplay was armed (used for reset grace period)
+unsigned long everdrive_gameplay_started_ms = 0;
+// Everdrive: count RESET events during gameplay (security signal; boot/setup resets are excluded)
+uint8_t everdrive_gameplay_reset_count = 0;
+// Everdrive: becomes true when the bus is opened for the selected game (GAME_INFO received).
+// The RESET immediately after this is the "final" expected RESET that starts gameplay.
+bool everdrive_bus_opened_for_game = false;
+char bridge_lockout_reason[48] = {0};  // From bridge /status: lockout_reason for TFT/serial diagnostics
+bool everdrive_waiting_for_initial_reset = false;  // Everdrive: require first RESET (menu) before "Choose Your Game"
+unsigned long everdrive_wait_reset_started_ms = 0;  // Everdrive: timestamp when we started waiting for initial reset
 long go_back_to_title_screen_timestamp;
+bool status_check_pending = false;  // Everdrive: queue status check when achievement received
 unsigned long last_wifi_status_update = 0;
 
 /**
@@ -524,10 +616,13 @@ bool get_MD5(const char* crc, bool first_bank, char* md5_out, size_t md5_out_siz
         (!first_bank && strcmp(crc2_buffer, crc_upper) == 0))
     {
       file.close();
-      // Copy result to output buffer
+      // Copy result to output buffer - normalize to lowercase (RA expects lowercase MD5)
       size_t copy_len = strlen(md5_buffer);
       if (copy_len >= md5_out_size) copy_len = md5_out_size - 1;
-      memcpy(md5_out, md5_buffer, copy_len);
+      for (size_t i = 0; i < copy_len; i++) {
+        char c = md5_buffer[i];
+        md5_out[i] = (c >= 'A' && c <= 'F') ? (c + 32) : c;
+      }
       md5_out[copy_len] = '\0';
       return true;
     }
@@ -1168,7 +1263,8 @@ void print_line(const char* text, int line, int line_status, int delta, int colo
 {
   #ifdef ENABLE_LCD
   tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, color, true);
+  uint16_t textColor = (color == TFT_YELLOW) ? TFT_BLACK : TFT_WHITE;
+  tft.setTextColor(textColor, color, true);
   tft.setCursor(20, 90 + line * 22, 2);
   tft.println("                                 ");
   tft.setCursor(46 + delta, 90 + line * 22, 2);
@@ -1201,6 +1297,84 @@ void clean_screen_text()
   print_line("", 3, -1);
   print_line("", 4, -1);
 }
+
+#ifdef ENABLE_LCD
+// Ensure the black rounded text box exists behind print_line() output.
+// (Some screens temporarily clear/paint this area; Everdrive UX wants white-on-black consistently.)
+static inline void ensure_black_text_box()
+{
+  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_BLACK);
+}
+#else
+static inline void ensure_black_text_box() {}
+#endif
+
+static const char* lockout_reason_display(const char* reason)
+{
+  if (!reason || !reason[0]) return "Unknown";
+  if (strcmp(reason, "unplug_15s") == 0) return "Everdrive Offline";
+  if (strcmp(reason, "everdrive_offline_15s") == 0) return "Everdrive Offline";
+  if (strcmp(reason, "bridge_offline_15s") == 0) return "Bridge Offline";
+  if (strcmp(reason, "bridge_offline_25s") == 0) return "Bridge Offline";
+  if (strcmp(reason, "bridge_lockout") == 0) return "Bridge Lockout";
+  if (strcmp(reason, "cheats_or_savestates") == 0) return "Cheats/Savestates";
+  return reason;
+}
+
+// Enter irreversible security lockout (Everdrive anti-cheat).
+static void enter_security_lockout(const char* reason)
+{
+  everdrive_mode = false;
+  security_lockout_active = true;
+  state = STATE_SECURITY_LOCKOUT;
+  digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_DISABLE_BUS);  // Close memory flow
+
+  Serial.print(F("[Lockout] "));
+  if (reason && reason[0]) Serial.println(reason);
+  else Serial.println(F("unknown"));
+
+#ifdef ENABLE_LCD
+  ensure_black_text_box();
+  clean_screen_text();
+  print_line("Turn off Console.", 0, -1);
+  print_line("Ahh ahh ahh you didnt say", 1, -1);
+  print_line("The magic word!", 2, -1);
+  print_line("Reason", 3, -1);
+  print_line(lockout_reason_display(reason), 4, -1);
+#else
+  print_line("Ah ah ah you didn't say", 1, 2);
+  print_line("the magic word...", 2, 2);
+  print_line("Turn off Console.", 4, 2);
+#endif
+
+  // Tell bridge we locked out so it can clear sticky lockout state.
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(1000);
+    String url = "http://";
+    url += EVERDRIVE_BRIDGE_HOST;
+    url += ":";
+    url += String(EVERDRIVE_BRIDGE_PORT);
+    url += "/lockout_ack?reason=";
+    url += (reason && reason[0]) ? String(reason) : String("unknown");
+    if (http.begin(client, url)) {
+      http.GET();
+      http.end();
+    }
+  }
+}
+
+#ifdef ENABLE_LCD
+// Clear game picture (name, counter, image) when showing disconnect message.
+// Restore happens when show_title_screen() is called after reconnection.
+void clear_game_display_for_disconnect(void)
+{
+  tft.fillRect(0, 0, 240, 80, TFT_YELLOW);   // Clear top area (game name, counter)
+  tft.fillRoundRect(20, 80, 200, 120, 12, TFT_YELLOW);  // Clear game image area
+  showWifiStatus();  // Redraw WiFi icon (was in cleared area)
+}
+#endif
 
 // Show WiFi signal strength icon at top-right corner
 void showWifiStatus()
@@ -1305,7 +1479,7 @@ void show_achievement(achievements_t achievement)
   sprintf(aux, "A=%s;%s;%s", "0", achievement.title.c_str(), achievement.url.c_str());
   send_ws_data(aux);
 #endif
-#ifdef ENABLE_LCD  
+#ifdef ENABLE_LCD
   analogWrite(LCD_BRIGHTNESS_PIN, 200); // set the brightness of the TFT screen
   // if achievement title is longer than 26 chars, add ... at the end
   if (achievement.title.length() > 26)
@@ -1480,6 +1654,121 @@ size_t read_ra_pass_from_eeprom(char* buffer, size_t buffer_size)
 }
 
 /**
+ * OTA firmware update - check update server on boot, download with progress bar if available.
+ * Returns true if update was applied (ESP restarts, never returns). Returns false if no update.
+ */
+#ifdef ENABLE_LCD
+void draw_update_progress(int percent) {
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK, true);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Updating firmware", 120, 70, 2);
+  tft.drawString("Do not power off", 120, 95, 2);
+  // Bar outline: 40, 130, 160x20
+  tft.drawRect(38, 128, 164, 24, TFT_WHITE);
+  tft.fillRect(40, 130, (160 * percent) / 100, 20, TFT_GREEN);
+  char pct_str[8];
+  snprintf(pct_str, sizeof(pct_str), "%d%%", percent);
+  tft.drawString(pct_str, 120, 175, 4);
+}
+#endif
+
+bool try_ota_update() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(OTA_UPDATE_TIMEOUT_MS);
+  // Step 1: Check if update is ready
+  String statusUrl = "http://";
+  statusUrl += OTA_UPDATE_HOST;
+  statusUrl += ":";
+  statusUrl += String(OTA_UPDATE_PORT);
+  statusUrl += OTA_UPDATE_STATUS_PATH;
+  if (!http.begin(client, statusUrl)) return false;
+  int code = http.GET();
+  String payload = http.getString();
+  http.end();
+  if (code != 200) return false;
+  if (payload.indexOf("\"update_ready\":true") < 0) return false;  // No update ready
+  // Bridge has update ready - show on screen (user sees ESP is ready for update)
+#ifdef ENABLE_LCD
+  clean_screen_text();
+  print_line("Ready for update", 1, 0);
+  delay(1000);
+#endif
+  // Step 2: Request firmware - app shows OK/Cancel; Cancel returns 404
+  String url = "http://";
+  url += OTA_UPDATE_HOST;
+  url += ":";
+  url += String(OTA_UPDATE_PORT);
+  url += OTA_UPDATE_FIRMWARE_PATH;
+  if (!http.begin(client, url)) return false;
+  code = http.GET();
+  if (code != 200) {
+    http.end();
+#ifdef ENABLE_LCD
+    print_line("Update cancelled", 2, 2);
+    delay(2000);
+#endif
+    return false;  // User cancelled or error
+  }
+  size_t contentLength = http.getSize();
+  if (contentLength == 0 || contentLength > 0x140000) {  // 0 or > 1.3MB reject
+    http.end();
+    return false;
+  }
+  if (!Update.begin(contentLength)) {
+    http.end();
+    return false;
+  }
+#ifdef ENABLE_LCD
+  draw_update_progress(0);
+#endif
+  Stream& stream = http.getStream();
+  uint8_t buf[512];
+  size_t written = 0;
+  int last_pct = -1;
+  unsigned long last_draw = millis();
+  while (written < contentLength) {
+    size_t toRead = stream.available();
+    if (toRead == 0) {
+      if (!client.connected()) break;
+      delay(10);
+      continue;
+    }
+    if (toRead > sizeof(buf)) toRead = sizeof(buf);
+    size_t n = stream.readBytes(buf, toRead);
+    if (n == 0) break;
+    if (Update.write(buf, n) != n) {
+      Update.abort();
+      http.end();
+      return false;
+    }
+    written += n;
+    int pct = (int)((written * 100) / contentLength);
+    if (pct > 100) pct = 100;
+#ifdef ENABLE_LCD
+    if (pct != last_pct || (millis() - last_draw) > 200) {
+      last_pct = pct;
+      last_draw = millis();
+      draw_update_progress(pct);
+    }
+#endif
+  }
+  http.end();
+  if (written != contentLength) {
+    Update.abort();
+    return false;
+  }
+  if (Update.end(true)) {
+    ESP.restart();
+  }
+  return false;
+}
+
+/**
  * functions related to the wifi manager
  */
 
@@ -1538,14 +1827,14 @@ String try_login_RA(String ra_user, String ra_pass)
   return ra_token;
 }
 
-// Versão que extrai token do CharBufferStream sem criar cópia
+// Vers├úo que extrai token do CharBufferStream sem criar c├│pia
 String extractTokenFromBuffer(CharBufferStream &buf)
 {
   const char* key = "\"Token\":";
   int start = buf.indexOf(key);
   if (start == -1) return "";
 
-  // Avança até o início do valor (pula aspas)
+  // Avan├ºa at├⌐ o in├¡cio do valor (pula aspas)
   start = buf.indexOf("\"", start + 8);
   if (start == -1) return "";
 
@@ -1869,6 +2158,74 @@ void send_ws_data(String data)
   }
 }
 
+#ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
+// LittleFS upload handler - accepts games.txt only
+void handleLittleFSUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (filename != "games.txt") {
+    if (final) request->send(400, "text/plain", "Only games.txt allowed");
+    return;
+  }
+  static File uploadFile;
+  if (!index) {
+    Serial.println(F("LittleFS upload: games.txt start"));
+    uploadFile = LittleFS.open("/games.txt", "w");
+    if (!uploadFile) {
+      Serial.println(F("LittleFS open failed"));
+      if (final) request->send(500, "text/plain", "Write failed");
+      return;
+    }
+  }
+  if (data && len) {
+    uploadFile.write(data, len);
+  }
+  if (final) {
+    uploadFile.close();
+    Serial.println(F("LittleFS upload: games.txt done, rebooting"));
+    request->send(200, "text/plain", "OK");
+    delay(500);
+    ESP.restart();
+  }
+}
+
+// OTA firmware upload - accepts firmware.bin, writes to flash, reboots
+void handleOTAUpload(AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final) {
+  if (filename != "firmware.bin") {
+    if (final) request->send(400, "text/plain", "Only firmware.bin allowed");
+    return;
+  }
+  static size_t totalSize = 0;
+  if (!index) {
+    totalSize = 0;
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Serial.println(F("OTA Update.begin failed"));
+      if (final) request->send(500, "text/plain", "Update failed");
+      return;
+    }
+    Serial.println(F("OTA upload: firmware.bin start"));
+  }
+  if (data && len) {
+    if (Update.write(data, len) != len) {
+      Update.abort();
+      Serial.println(F("OTA Update.write failed"));
+      if (final) request->send(500, "text/plain", "Write failed");
+      return;
+    }
+    totalSize += len;
+  }
+  if (final) {
+    if (Update.end(true)) {
+      Serial.println(F("OTA upload: done, rebooting"));
+      request->send(200, "text/plain", "OK");
+      delay(500);
+      ESP.restart();
+    } else {
+      Serial.println(F("OTA Update.end failed"));
+      request->send(500, "text/plain", "Update failed");
+    }
+  }
+}
+#endif
+
 // initialize the websocket server (dynamically allocated to save memory until needed)
 void init_websocket()
 {
@@ -1911,6 +2268,20 @@ void init_websocket()
 
   server->serveStatic("/snd.mp3", LittleFS, "/snd.mp3")
       .setCacheControl("max-age=86400");
+
+  // LittleFS upload: games.txt only (from RA Adapter app)
+  server->on("/upload", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      request->send(200, "text/plain", "OK");
+    },
+    handleLittleFSUpload);
+
+  // OTA firmware upload: push .bin directly to running ESP32
+  server->on("/ota", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      request->send(200, "text/plain", "OK");
+    },
+    handleOTAUpload);
 
   server->addHandler(ws);
   server->begin();
@@ -2035,11 +2406,20 @@ int perform_http_request_buffer(
         
         Serial.print(F("Content-Length: ")); Serial.print(contentLength); Serial.print(F(" (chunked: ")); Serial.print(isChunked); Serial.println(F(")"));
         
-        // Check if it fits in the buffer (if Content-Length is known)
+        // If response is larger than current buffer, try to resize (up to MAX_RESPONSE_BUFFER_SIZE)
         if (contentLength > 0 && contentLength > (int)resp.capacity()) {
-          Serial.print(F("Response too big: ")); Serial.print(contentLength); Serial.print(F(" > ")); Serial.println(resp.capacity());
-          globalHttpClient.end();
-          return HTTP_ERR_REPONSE_TOO_BIG;
+          size_t needed = (size_t)contentLength;
+          if (needed > MAX_RESPONSE_BUFFER_SIZE) {
+            Serial.print(F("Response too big: ")); Serial.print(contentLength); Serial.print(F(" > max ")); Serial.println(MAX_RESPONSE_BUFFER_SIZE);
+            globalHttpClient.end();
+            return HTTP_ERR_REPONSE_TOO_BIG;
+          }
+          if (!resp.reserve(needed)) {
+            Serial.print(F("Failed to allocate ")); Serial.print(needed); Serial.println(F(" bytes for response"));
+            globalHttpClient.end();
+            return HTTP_ERR_REPONSE_TOO_BIG;
+          }
+          Serial.print(F("Resized buffer to ")); Serial.print(needed); Serial.println(F(" bytes"));
         }
         
         resp.clear();
@@ -2168,7 +2548,7 @@ int perform_http_request_buffer(
             return HTTP_ERR_REPONSE_TOO_BIG;
           }
           
-          // Se não é chunked e já leu tudo
+          // Se n├úo ├⌐ chunked e j├í leu tudo
           if (!isChunked && contentLength > 0 && totalRead >= (size_t)contentLength) {
             break;
           }
@@ -2264,7 +2644,8 @@ bool starts_with(const char* buf, size_t len, const char* prefix) {
  */
 void handle_req_command(const char* cmd, size_t cmd_len) {
   // Example: FF;M:POST;U:https://retroachievements.org/dorequest.php;D:r=login2&u=user&p=pass
-  
+  Serial.println(F(">>> REQ RECEIVED <<<"));  // Unmissable log for bridge monitor
+
   // Find request_id (up to first ';')
   int pos = find_char(cmd, cmd_len, ';');
   if (pos < 0 || pos > 8) {
@@ -2381,12 +2762,37 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
   if (ret < 0) {
     Serial.print(F("ERROR ON RESPONSE: "));
     Serial.println(http_request_result_to_cstr(ret));
+    // Everdrive mode: don't enter the fatal "turn off console" state machine.
+    // Instead, immediately reply to Pico with a non-200 status so it doesn't hang waiting.
+    if (everdrive_mode) {
+      // Back off bridge polling for a short period while WiFi/TLS recovers.
+      // This reduces concurrent network work during intermittent connectivity.
+      const unsigned long pause_ms = 10000;
+      everdrive_pause_bridge_poll_until_ms = millis() + pause_ms;
+      Serial0.print(F("RESP="));
+      Serial0.print(request_id);
+      // Pico parses the 3-digit status as HEX and treats status==0 with a message as retryable.
+      // Send 000 so Pico will map it to RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR.
+      Serial0.print(F(";000;"));
+      Serial0.print(http_request_result_to_cstr(ret));
+      Serial0.print(F("\r\n"));
+
+      Serial.print(F("RESP="));
+      Serial.print(request_id);
+      Serial.println(F("; (error 000 retryable)"));
+      response.clear();
+      goto req_cleanup;
+    }
+
+    // Non-Everdrive (Odelot): preserve original fatal behavior.
     if (ret == HTTP_ERR_REPONSE_TOO_BIG) {
       state = STATE_ERROR_RESPONSE_TOO_BIG;
     } else {
       state = STATE_ERROR_CONNECTIVITY;
     }
   } else {
+    // Everdrive: any successful RA call means connectivity is back; resume bridge polling immediately.
+    if (everdrive_mode) everdrive_pause_bridge_poll_until_ms = 0;
     // Clean JSON in-place
     if (is_patch_request) {
       Serial.print(F("PATCH LENGTH: "));
@@ -2456,6 +2862,7 @@ void handle_req_command(const char* cmd, size_t cmd_len) {
     Serial.println(F(";"));
   }
   
+req_cleanup:
   response.clear();
   
   // After patch, release large buffer and reallocate small buffer
@@ -2517,6 +2924,52 @@ void handle_read_crc_command(const char* cmd, size_t cmd_len) {
   Serial.print(F("END_CRC="));
   Serial.println(end_CRC);
   
+  // Everdrive detection - open bus immediately so user can select game.
+  // We use cart CRC ONLY to detect Everdrive; we NEVER look it up in games.txt.
+  // Game identity comes from bridge (SELECT_GAME=md5), not from cartridge.
+  char bc[10], ec[10];
+  strncpy(bc, begin_CRC, 8); bc[8] = '\0';
+  strncpy(ec, end_CRC, 8); ec[8] = '\0';
+  for (char* p = bc; *p; p++) *p = toupper(*p);
+  for (char* p = ec; *p; p++) *p = toupper(*p);
+  bool is_everdrive = false;
+  for (size_t i = 0; i < EVERDRIVE_CRCS_COUNT; i++) {
+    if (strcmp(bc, EVERDRIVE_CRCS[i].begin) == 0 && strcmp(ec, EVERDRIVE_CRCS[i].end) == 0) {
+      is_everdrive = true;
+      break;
+    }
+  }
+  if (is_everdrive) {
+    Serial.println(F("Everdrive detected - entering Everdrive mode"));
+    state = STATE_EVERDRIVE_WAIT_GAME;
+    Serial.println(F("READY_FOR_CRC"));
+    digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_ENABLE_BUS);
+    // Reset Everdrive session flags
+    everdrive_mode = false;
+    everdrive_game_received_this_session = false;
+    everdrive_pending_game_found_screen = false;
+    everdrive_security_armed = false;
+    everdrive_bridge_trusted = false;
+    everdrive_last_good_ms = 0;
+    everdrive_gameplay_started_ms = 0;
+    everdrive_gameplay_reset_count = 0;
+    everdrive_bus_opened_for_game = false;
+    everdrive_waiting_for_initial_reset = true;
+    everdrive_wait_reset_started_ms = millis();
+    // Everdrive TFT UX:
+    // 1) Brief EVERDRIVE MODE splash
+    // 2) Choose game + submit via bridge
+    ensure_black_text_box();
+    clean_screen_text();
+    print_line("EVERDRIVE MODE", 2, -1);
+    delay(2000);
+    ensure_black_text_box();
+    clean_screen_text();
+    print_line("RESET CONSOLE", 2, -1);
+    print_line("to open Everdrive menu", 3, -1);
+    return;
+  }
+  
   // Search MD5 by initial CRC - use char* version to avoid fragmentation
   md5_global[0] = '\0';
   bool found = get_MD5(begin_CRC, true, md5_global, sizeof(md5_global));
@@ -2538,6 +2991,452 @@ void handle_read_crc_command(const char* cmd, size_t cmd_len) {
     Serial.println(md5_global);
     state = STATE_CRC_FOUND;
   }
+}
+
+/**
+ * Handler for SELECT_GAME_CRC=begin,end - From Everdrive bridge (USB Serial).
+ * Bridge sends CRC (same format as Pico). ESP32 does games.txt lookup (same as normal cart).
+ */
+void handle_select_game_crc_command(const char* cmd, size_t cmd_len) {
+  // Only accept from bridge when Pico already detected Everdrive (STATE_EVERDRIVE_WAIT_GAME)
+  if (state != STATE_EVERDRIVE_WAIT_GAME) return;
+  // Expected: 8 hex + comma + 8 hex = 17 chars
+  if (cmd_len < 17) return;
+  char bc[10], ec[10];
+  memcpy(bc, cmd, 8);
+  bc[8] = '\0';
+  memcpy(ec, cmd + 9, 8);
+  ec[8] = '\0';
+  if (cmd[8] != ',') return;
+  for (char* p = bc; *p; p++) *p = toupper(*p);
+  for (char* p = ec; *p; p++) *p = toupper(*p);
+  md5_global[0] = '\0';
+  bool found = get_MD5(bc, true, md5_global, sizeof(md5_global));
+  if (!found) found = get_MD5(ec, false, md5_global, sizeof(md5_global));
+  if (!found) {
+    Serial.print(F("SELECT_GAME_CRC: not in games.txt: "));
+    Serial.print(bc);
+    Serial.print(F(","));
+    Serial.println(ec);
+    // Everdrive TFT UX: game not recognized
+    ensure_black_text_box();
+    clean_screen_text();
+    print_line("Game not Found!", 1, -1);
+    print_line("Please Restart Console", 2, -1);
+    print_line("and Try Again", 3, -1);
+    return;
+  }
+  Serial.print(F("SELECT_GAME_CRC: "));
+  Serial.print(bc);
+  Serial.print(F(","));
+  Serial.print(ec);
+  Serial.print(F(" -> "));
+  Serial.println(md5_global);
+  // Remember the expected game CRC pair for game-change detection in gameplay watchdog.
+  snprintf(everdrive_expected_crc_pair, sizeof(everdrive_expected_crc_pair), "%s,%s", bc, ec);
+  everdrive_bus_opened_for_game = false;  // Not yet; bus will be opened after GAME_INFO (final step before gameplay)
+  digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_DISABLE_BUS);
+  Serial0.print(F("CRC_FOUND_MD5="));
+  Serial0.print(md5_global);
+  Serial0.print(F("\r\n"));
+  everdrive_mode = true;
+  everdrive_game_received_this_session = true;  // Never show "1.RESET now" again until reboot
+  everdrive_pending_game_found_screen = true;
+  // Bridge was able to submit a game -> trust baseline for watchdog (armed later on NES_RESETED)
+  everdrive_bridge_trusted = true;
+  everdrive_last_good_ms = millis();
+  // Everdrive TFT UX: loading while ESP/Pico fetch RA data
+  ensure_black_text_box();
+  clean_screen_text();
+  print_line("-----Loading-----", 2, -1);
+  state = STATE_CRC_FOUND;
+}
+
+/**
+ * Poll bridge GET /game for game data. Called when in EVERDRIVE_WAIT_GAME.
+ */
+int poll_bridge_status_abortable(String* out_game = nullptr);  // forward decl (used by poll_bridge_for_game)
+void poll_bridge_for_game() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  // Only advance to loading when ALL are true:
+  // - Everdrive detected (we're in STATE_EVERDRIVE_WAIT_GAME)
+  // - Bridge reachable AND everdrive_connected==true AND cheats_ok==true
+  // - A game CRC is present in /status (game: "SELECT_GAME_CRC=....")
+  String gameFromStatus;
+  int status = poll_bridge_status_abortable(&gameFromStatus);
+  if (status == 9) {
+    // Pre-game: do NOT hard-lockout. Just show reason and refuse to proceed until cleared.
+    ensure_black_text_box();
+    clean_screen_text();
+    print_line("Bridge reported lockout", 1, -1);
+    print_line("Reason", 2, -1);
+    print_line(lockout_reason_display(bridge_lockout_reason), 3, -1);
+    print_line("Fix it, then Submit Game", 4, -1);
+    return;
+  }
+  if (status != 2) return;  // Not ready (not connected or cheats not OK)
+  if (!gameFromStatus.startsWith("SELECT_GAME_CRC=")) return;
+  int idx = gameFromStatus.indexOf("SELECT_GAME_CRC=");
+  const char* start = gameFromStatus.c_str() + idx + 16;
+  size_t len = 0;
+  while (start[len] && start[len] != '\r' && start[len] != '\n' && start[len] != ' ' && len < 32) len++;
+  if (len >= 17) {
+    everdrive_bridge_trusted = true;
+    everdrive_last_good_ms = millis();
+    // If Pico never sent NES_RESETED but we already got a valid game from bridge,
+    // allow Everdrive flow to proceed (prevents being stuck on RESET screen).
+    if (everdrive_waiting_for_initial_reset) {
+      everdrive_waiting_for_initial_reset = false;
+      Serial.println(F("[Everdrive] Proceeding without NES_RESETED (game received from bridge)"));
+    }
+    handle_select_game_crc_command(start, 17);
+    // Tell bridge it can clear the stored game now (prevents repeated serving/spam on reboot/menu).
+    {
+      WiFiClient c;
+      HTTPClient h;
+      h.setTimeout(1000);
+      String url = "http://";
+      // Use same host (or its resolved IP) as status polling; if .local resolution is flaky,
+      // the watchdog will still have the cached IP for the main status path.
+      url += EVERDRIVE_BRIDGE_HOST;
+      url += ":";
+      url += String(EVERDRIVE_BRIDGE_PORT);
+      url += "/game_ack";
+      if (h.begin(c, url)) {
+        h.GET();
+        h.end();
+      }
+    }
+  }
+}
+
+/**
+ * Poll bridge GET /status.
+ * Returns: 2 = connected (heartbeat fresh, everdrive ok)
+ *          1 = everdrive disconnected (heartbeat fresh but everdrive_connected false)
+ *          0 = app disconnected (bridge unreachable OR same heartbeat twice = app stopped)
+ */
+int poll_bridge_status() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  static int last_heartbeat = -1;
+  static unsigned long last_heartbeat_change_ms = 0;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(2000);
+  String url = "http://";
+  url += EVERDRIVE_BRIDGE_HOST;
+  url += ":";
+  url += String(EVERDRIVE_BRIDGE_PORT);
+  url += "/status";
+  if (!http.begin(client, url)) return 0;
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return 0;
+  }
+  String payload = http.getString();
+  http.end();
+  // Parse heartbeat: "heartbeat":1234567890 (app updates every 5s)
+  int hbStart = payload.indexOf("\"heartbeat\":");
+  int heartbeat = -1;
+  if (hbStart >= 0) {
+    hbStart += 12; // length of "\"heartbeat\":" including colon
+    while (hbStart < (int)payload.length() && (payload[hbStart] == ' ' || payload[hbStart] == '\t')) hbStart++;
+    int hbEnd = payload.indexOf(",", hbStart);
+    if (hbEnd < 0) hbEnd = payload.indexOf("}", hbStart);
+    if (hbEnd > hbStart) {
+      heartbeat = payload.substring(hbStart, hbEnd).toInt();
+    }
+  }
+  // Heartbeat stale (no change for a while) = app stopped updating = disconnected.
+  // Use "time since last change", not "time since last poll".
+  unsigned long now = millis();
+  if (heartbeat >= 0) {
+    if (last_heartbeat < 0) {
+      last_heartbeat = heartbeat;
+      last_heartbeat_change_ms = now;
+    } else if (heartbeat != last_heartbeat) {
+      last_heartbeat = heartbeat;
+      last_heartbeat_change_ms = now;
+    }
+    // HEARTBEAT_INTERVAL in bridge is 5s; allow jitter and sampling alignment.
+    if (last_heartbeat_change_ms > 0 && (now - last_heartbeat_change_ms) >= 15000) {
+      return 0;  // App disconnected - heartbeat didn't change for 15s
+    }
+  }
+  if (payload.indexOf("\"everdrive_connected\":true") >= 0 ||
+      payload.indexOf("\"everdrive_connected\": true") >= 0) return 2;
+  return 1;  // Bridge reachable but Everdrive unplugged
+}
+
+/**
+ * Abortable status poll for Everdrive. Checks Serial0 for "A=" (achievement) during HTTP.
+ * Returns:
+ *   9 = lockout requested by bridge (lockout=true)
+ *   2 = connected (everdrive_connected && cheats_ok)
+ *   3 = cheats not ok
+ *   1 = everdrive disconnected
+ *   0 = app disconnected
+ *  -2 = aborted (achievement received)
+ * If out_game non-null and status 2, parses "game" from JSON into out_game (e.g. "SELECT_GAME_CRC=xxx,yyy").
+ */
+int poll_bridge_status_abortable(String* out_game) {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  WiFiClient client;
+  static IPAddress cachedBridgeIp;
+  static unsigned long cachedBridgeIpAtMs = 0;
+  IPAddress bridgeIp;
+  bool haveIp = false;
+  const IPAddress IP_ZERO(0, 0, 0, 0);
+  // Resolve .local via mDNS query (router DNS typically won't resolve .local).
+  // Also supports literal IP in EVERDRIVE_BRIDGE_HOST.
+  {
+    const char* host = EVERDRIVE_BRIDGE_HOST;
+    if (host && host[0]) {
+      // Use cached IP if still fresh (avoid mDNS flakiness mid-game)
+      if (cachedBridgeIpAtMs > 0 && (millis() - cachedBridgeIpAtMs) < 60000 && cachedBridgeIp != IP_ZERO) {
+        bridgeIp = cachedBridgeIp;
+        haveIp = true;
+      }
+      // Literal IP?
+      if (!haveIp && bridgeIp.fromString(host)) {
+        haveIp = true;
+      } else {
+        String h(host);
+        if (h.endsWith(".local")) {
+          String name = h.substring(0, h.length() - 6);
+          IPAddress ip = MDNS.queryHost(name);
+          if (ip != INADDR_NONE) {
+            bridgeIp = ip;
+            haveIp = true;
+          }
+        }
+        if (!haveIp) {
+          IPAddress ip;
+          if (WiFi.hostByName(host, ip) && ip != IP_ZERO && ip != INADDR_NONE) {
+            bridgeIp = ip;
+            haveIp = true;
+          }
+        }
+      }
+    }
+  }
+  // Guard: some resolvers can return 0.0.0.0 on failure.
+  if (haveIp && bridgeIp == IP_ZERO) {
+    haveIp = false;
+  }
+  Serial.print(F("[Bridge] Polling "));
+  Serial.print(EVERDRIVE_BRIDGE_HOST);
+  Serial.print(F(":"));
+  Serial.println(EVERDRIVE_BRIDGE_PORT);
+  // Important: keep this quick; long connect retries can block achievement processing and cause false strikes.
+  if (haveIp) {
+    // Cache for future polls (but never cache 0.0.0.0)
+    if (bridgeIp != IP_ZERO) {
+      cachedBridgeIp = bridgeIp;
+      cachedBridgeIpAtMs = millis();
+    }
+    Serial.print(F("[Bridge] IP="));
+    Serial.println(bridgeIp);
+  } else {
+    Serial.println(F("[Bridge] Resolve FAILED (try setting EVERDRIVE_BRIDGE_HOST to PC IP)"));
+  }
+  bool connected = haveIp
+    ? client.connect(bridgeIp, EVERDRIVE_BRIDGE_PORT, EVERDRIVE_BRIDGE_CONNECT_TIMEOUT_MS)
+    : client.connect(EVERDRIVE_BRIDGE_HOST, EVERDRIVE_BRIDGE_PORT, EVERDRIVE_BRIDGE_CONNECT_TIMEOUT_MS);
+  if (!connected) {
+    Serial.print(F("[Bridge] Connect FAILED (timeout_ms="));
+    Serial.print(EVERDRIVE_BRIDGE_CONNECT_TIMEOUT_MS);
+    Serial.println(F(")"));
+    Serial.print(F("[Bridge] WiFi status="));
+    Serial.print((int)WiFi.status());
+    Serial.print(F(" RSSI="));
+    Serial.println(WiFi.RSSI());
+    WiFi.reconnect();
+    return 0;
+  }
+  // Allow reads to complete; 1ms is too aggressive on slower/loaded networks.
+  client.setTimeout(50);
+  String req = "GET /status HTTP/1.1\r\nHost: ";
+  req += EVERDRIVE_BRIDGE_HOST;
+  req += "\r\nConnection: close\r\n\r\n";
+  client.print(req);
+  String payload;
+  unsigned long start = millis();
+  while (client.connected() || client.available()) {
+    // Abort on A= (achievement display) or REQ= (achievement API submit) - both need immediate processing
+    if (Serial0.available() >= 2 && (Serial0.peek() == 'A' || (Serial0.available() >= 3 && Serial0.peek() == 'R'))) {
+      client.stop();
+      return -2;  // Abort - achievement incoming
+    }
+    if (client.available()) {
+      payload += client.readString();
+    }
+    if (millis() - start > EVERDRIVE_BRIDGE_STATUS_READ_TIMEOUT_MS) break;
+    yield();
+  }
+  client.stop();
+  if (payload.length() == 0) {
+    Serial.println(F("[Bridge] Empty response"));
+    return 0;
+  }
+  // Log what we got (first 120 chars covers everdrive_connected in JSON)
+  int jsonStart = payload.indexOf('{');
+  if (jsonStart >= 0) {
+    String snippet = payload.substring(jsonStart, jsonStart + 120);
+    Serial.print(F("[Bridge] Response: "));
+    Serial.println(snippet);
+  }
+  // Heartbeat freshness: if app stops updating heartbeat, treat as disconnected.
+  static int last_heartbeat = -1;
+  static unsigned long last_heartbeat_change_ms = 0;
+  int hbStart = payload.indexOf("\"heartbeat\":");
+  int heartbeat = -1;
+  if (hbStart >= 0) {
+    hbStart += 12; // length of "\"heartbeat\":" including colon
+    while (hbStart < (int)payload.length() && (payload[hbStart] == ' ' || payload[hbStart] == '\t')) hbStart++;
+    int hbEnd = payload.indexOf(",", hbStart);
+    if (hbEnd < 0) hbEnd = payload.indexOf("}", hbStart);
+    if (hbEnd > hbStart) heartbeat = payload.substring(hbStart, hbEnd).toInt();
+  }
+  if (heartbeat >= 0) {
+    Serial.print(F("[Bridge] Heartbeat="));
+    Serial.println(heartbeat);
+  } else {
+    Serial.println(F("[Bridge] Heartbeat=missing"));
+  }
+  unsigned long now = millis();
+  if (heartbeat >= 0) {
+    if (last_heartbeat < 0) {
+      last_heartbeat = heartbeat;
+      last_heartbeat_change_ms = now;
+    } else if (heartbeat != last_heartbeat) {
+      last_heartbeat = heartbeat;
+      last_heartbeat_change_ms = now;
+    }
+    if (last_heartbeat_change_ms > 0 && (now - last_heartbeat_change_ms) >= 15000) {
+      Serial.println(F("[Bridge] Heartbeat stale -> status 0 (app disconnected)"));
+      return 0;
+    }
+  }
+
+  // Optional: active CRC reported by bridge (best-effort, used for game-change detection).
+  // JSON fields: "active_crc":"XXXXXXXX,YYYYYYYY" and "active_crc_in_menu":true/false (may be null/missing).
+  {
+    int k = payload.indexOf("\"active_crc\":");
+    if (k >= 0) {
+      int p = k + 13;
+      while (p < (int)payload.length() && (payload[p] == ' ' || payload[p] == '\t')) p++;
+      if (p < (int)payload.length() && payload[p] == '"') {
+        int q2 = payload.indexOf("\"", p + 1);
+        if (q2 > p) {
+          String v = payload.substring(p + 1, q2);
+          v.trim();
+          if (v.length() > 0 && v.length() < (int)sizeof(bridge_active_crc_pair)) {
+            v.toUpperCase();
+            v.toCharArray(bridge_active_crc_pair, sizeof(bridge_active_crc_pair));
+          } else if (v.length() == 0) {
+            bridge_active_crc_pair[0] = '\0';
+          }
+        }
+      } else {
+        // Could be null
+        if (payload.indexOf("null", p) == p) {
+          bridge_active_crc_pair[0] = '\0';
+        }
+      }
+    }
+    int km = payload.indexOf("\"active_crc_in_menu\":");
+    if (km >= 0) {
+      int pm = km + 20;
+      while (pm < (int)payload.length() && (payload[pm] == ' ' || payload[pm] == '\t')) pm++;
+      if (payload.indexOf("true", pm) == pm) bridge_active_crc_in_menu = true;
+      else if (payload.indexOf("false", pm) == pm) bridge_active_crc_in_menu = false;
+    }
+  }
+
+  // Bridge-driven lockout (preferred): lockout=true with reason.
+  // This reduces ESP load and gives precise diagnostics.
+  if (payload.indexOf("\"lockout\":true") >= 0 || payload.indexOf("\"lockout\": true") >= 0) {
+    bridge_lockout_reason[0] = '\0';
+    int rk = payload.indexOf("\"lockout_reason\":");
+    if (rk >= 0) {
+      int q1 = payload.indexOf("\"", rk + 16);
+      if (q1 >= 0) {
+        int q2 = payload.indexOf("\"", q1 + 1);
+        if (q2 > q1) {
+          String r = payload.substring(q1 + 1, q2);
+          size_t n = (size_t)min((int)sizeof(bridge_lockout_reason) - 1, (int)r.length());
+          memcpy(bridge_lockout_reason, r.c_str(), n);
+          bridge_lockout_reason[n] = '\0';
+        }
+      }
+    }
+    Serial.print(F("[Bridge] -> status 9 (LOCKOUT) reason="));
+    Serial.println(bridge_lockout_reason[0] ? bridge_lockout_reason : "unknown");
+    return 9;
+  }
+
+  bool edConnected = (payload.indexOf("\"everdrive_connected\":true") >= 0 ||
+                     payload.indexOf("\"everdrive_connected\": true") >= 0);
+  bool cheatsOk = (payload.indexOf("\"cheats_ok\":true") >= 0 ||
+                  payload.indexOf("\"cheats_ok\": true") >= 0);
+  if (edConnected && !cheatsOk) {
+    Serial.println(F("[Bridge] -> status 3 (CHEATS NOT OK)"));
+    return 3;
+  }
+  if (edConnected) {
+    if (out_game) {
+      int gameKey = payload.indexOf("\"game\":");
+      if (gameKey >= 0) {
+        int rest = gameKey + 7;
+        while (rest < (int)payload.length() && (payload[rest] == ' ' || payload[rest] == '\t')) rest++;
+        if (rest < (int)payload.length() && payload[rest] == '"') {
+          int q2 = payload.indexOf("\"", rest + 1);
+          if (q2 > rest) {
+            *out_game = payload.substring(rest + 1, q2);
+          }
+        }
+      }
+    }
+    Serial.println(F("[Bridge] -> status 2 (OK)"));
+    return 2;
+  }
+  Serial.println(F("[Bridge] -> status 1 (Everdrive offline in bridge)"));
+  return 1;
+}
+
+/**
+ * Handler for SELECT_GAME=md5 - Fallback if bridge sends MD5 directly.
+ */
+void handle_select_game_command(const char* cmd, size_t cmd_len) {
+  if (state != STATE_EVERDRIVE_WAIT_GAME) return;
+  if (cmd_len != 32) return;
+  for (size_t i = 0; i < 32; i++) {
+    char c = cmd[i];
+    if (c >= '0' && c <= '9') md5_global[i] = c;
+    else if (c >= 'a' && c <= 'f') md5_global[i] = c;
+    else if (c >= 'A' && c <= 'F') md5_global[i] = c + 32;
+    else return;
+  }
+  md5_global[32] = '\0';
+  Serial.print(F("SELECT_GAME received (MD5): "));
+  Serial.println(md5_global);
+  digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_DISABLE_BUS);
+  Serial0.print(F("CRC_FOUND_MD5="));
+  Serial0.print(md5_global);
+  Serial0.print(F("\r\n"));
+  // Unknown CRC pair (bridge sent MD5 only) -> skip game-change detection unless later set.
+  everdrive_expected_crc_pair[0] = '\0';
+  everdrive_mode = true;
+  everdrive_game_received_this_session = true;  // Never show "1.RESET now" again until reboot
+  everdrive_pending_game_found_screen = true;
+  everdrive_bridge_trusted = true;
+  everdrive_last_good_ms = millis();
+  ensure_black_text_box();
+  clean_screen_text();
+  print_line("-----Loading-----", 2, -1);
+  state = STATE_CRC_FOUND;
 }
 
 /**
@@ -2610,6 +3509,7 @@ void handle_achievement_command(const char* cmd, size_t cmd_len) {
     Serial.print(F("FIFO_FULL\r\n"));
   } else {
     Serial.print(F("ACHIEVEMENT_ADDED\r\n"));
+    if (everdrive_mode) status_check_pending = true;  // Queue status check after achievement
   }
 }
 
@@ -2696,6 +3596,24 @@ void handle_game_info_command(const char* cmd, size_t cmd_len) {
   if (esp_game_name.length() > 18) {
     esp_game_name = esp_game_name.substring(0, 15) + "...";
   }
+
+  // Everdrive TFT UX: show Game Found screen once, then require RESET to continue.
+  if (everdrive_mode) {
+    if (everdrive_pending_game_found_screen) {
+      everdrive_pending_game_found_screen = false;
+      ensure_black_text_box();
+      clean_screen_text();
+      print_line("Game Found! Loading", 1, -1);
+      print_line(esp_game_name.c_str(), 2, -1);
+      print_line("Press RESET to continue", 4, -1);
+    }
+    Serial.println(game_name);
+    // Enable the BUS
+    digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_ENABLE_BUS);
+    // Mark that the bus has been opened for the selected game (final pre-gameplay step).
+    everdrive_bus_opened_for_game = true;
+    return;
+  }
   
   char game_display[32];
   snprintf(game_display, sizeof(game_display), " * %s * ", esp_game_name.c_str());
@@ -2754,8 +3672,89 @@ void handle_ach_summary_command(const char* cmd, size_t cmd_len) {
 
 /**
  * Handler for NES_RESETED command - User reset the NES
+ * Only process once per power cycle - Everdrive may need multiple resets (bus off crashes it);
+ * we avoid going idle repeatedly and skipping Everdrive status polls.
  */
 void handle_nes_reset_command() {
+  // Everdrive pre-game: first RESET is used to open Everdrive menu; do not enter gameplay/idle yet.
+  // NOTE: everdrive_mode is only set true AFTER a game is submitted from the bridge.
+  // We must still handle pre-game RESETs while waiting in Everdrive mode.
+  if (state == STATE_EVERDRIVE_WAIT_GAME) {
+    if (everdrive_waiting_for_initial_reset) {
+      everdrive_waiting_for_initial_reset = false;
+      ensure_black_text_box();
+      clean_screen_text();
+      print_line("Choose Your Game", 1, -1);
+      print_line("Run RA Bridge (PC)", 2, -1);
+      print_line("Auto-detect enabled", 3, -1);
+      Serial.println(F("[Everdrive] Initial RESET received -> waiting for bridge submit"));
+      return;
+    }
+    // Additional resets before a game is submitted are fine; keep current screen and don't arm gameplay logic.
+    if (!everdrive_game_received_this_session) {
+      Serial.println(F("[Everdrive] RESET received (pre-game)"));
+      return;
+    }
+  }
+
+  // Everdrive mid-load: game was submitted, but bus isn't opened for the selected game yet.
+  // Ignore RESETs here; the user is still in the "loading/game found" phase.
+  if (everdrive_mode && !everdrive_bus_opened_for_game && !everdrive_security_armed) {
+    Serial.println(F("[Everdrive] RESET received (loading) -> ignored"));
+    return;
+  }
+
+  // Everdrive gameplay: allow multiple RESETs, but only enforce after a grace period.
+  // This prevents false triggers during the multi-reset boot flow and shortly after gameplay starts.
+  if (everdrive_mode && everdrive_security_armed) {
+    unsigned long nowMs = millis();
+    if (everdrive_gameplay_started_ms == 0) everdrive_gameplay_started_ms = nowMs;
+    unsigned long gameplayMs = nowMs - everdrive_gameplay_started_ms;
+
+    if (gameplayMs < EVERDRIVE_RESET_SECURITY_AFTER_MS) {
+      Serial.print(F("[Everdrive] RESET received during grace period (ms="));
+      Serial.print(gameplayMs);
+      Serial.println(F(") -> ignored"));
+      return;
+    }
+
+    // Count only "suspicious" resets (after grace). Boot/setup resets and early gameplay resets are excluded.
+    if (everdrive_gameplay_reset_count < 255) everdrive_gameplay_reset_count++;
+    Serial.print(F("[Everdrive] suspicious RESET count="));
+    Serial.println(everdrive_gameplay_reset_count);
+
+    // After grace: reset is suspicious (user could swap ROM). Force re-submit and reboot Pico to clear stale RA state.
+    Serial.println(F("[Everdrive] RESET after grace -> require re-submit (security)"));
+    // Reboot Pico so it cannot continue old achievement set against a different game.
+    Serial0.print(F("RESET\r\n"));
+    Serial0.flush();
+    delay(250);
+
+    everdrive_security_armed = false;
+    everdrive_mode = false;
+    everdrive_game_received_this_session = false;
+    everdrive_expected_crc_pair[0] = '\0';
+    bridge_active_crc_pair[0] = '\0';
+    everdrive_bus_opened_for_game = false;
+    // Keep bus open so user can return to menu and pick game.
+    state = STATE_EVERDRIVE_WAIT_GAME;
+    everdrive_waiting_for_initial_reset = false;
+    everdrive_wait_reset_started_ms = 0;
+    ensure_black_text_box();
+    clean_screen_text();
+    print_line("RESET detected", 1, -1);
+    print_line("Run RA Bridge again", 2, -1);
+    print_line("Re-submit game", 3, -1);
+    return;
+  }
+
+  // Non-Everdrive (and Everdrive pre-game): keep original "only once" behavior.
+  if (nes_reseted_handled_this_session) {
+    Serial.println(F("NES_RESETED ignored - already handled this session"));
+    return;
+  }
+  nes_reseted_handled_this_session = true;
+
   uint8_t random = (uint8_t)esp_random();
   game_session = String(random);
   
@@ -2771,6 +3770,21 @@ void handle_nes_reset_command() {
   
   show_title_screen();
   state = STATE_IDLE;
+  // Everdrive: arm security only after user RESETs into gameplay
+  if (everdrive_mode) {
+    // Only arm gameplay once the bus has been opened for the selected game.
+    // This syncs "gameplay started" with the final expected RESET.
+    if (everdrive_bus_opened_for_game) {
+      everdrive_security_armed = true;
+      everdrive_gameplay_started_ms = millis();
+      everdrive_gameplay_reset_count = 0;
+      Serial.println(F("[BridgeWD] ARMED (gameplay started)"));
+    } else {
+      Serial.println(F("[Everdrive] RESET received but bus not opened for game yet -> not arming"));
+    }
+    // We should already be trusted if we got here via bridge submit; but keep safe defaults.
+    if (everdrive_last_good_ms == 0) everdrive_last_good_ms = millis();
+  }
 }
 
 // Sync with Pico - sends SYNC command and waits for SYNC_ACK or PICO_READY
@@ -2877,11 +3891,13 @@ void setup()
   // Inicializar buffer serial fixo
   serial_buffer_len = 0;
   serial_buffer[0] = '\0';
+  serial_usb_buffer_len = 0;
+  serial_usb_buffer[0] = '\0';
 
   // initialize global strings
   game_id = "0";
   game_name = "not identified";
-  // base_url agora é const char* global, não precisa inicializar aqui
+  // base_url agora ├⌐ const char* global, n├úo precisa inicializar aqui
 
   // initialize stuff
   init_EEPROM(false); // initialize the EEPROM
@@ -2923,7 +3939,7 @@ void setup()
   handle_reset();
 
 
-  // Pré-inicializar o cliente SSL global (configura os buffers SSL)
+  // Pr├⌐-inicializar o cliente SSL global (configura os buffers SSL)
   globalSecureClient.setInsecure();
   globalSecureClient.setTimeout(15);
   httpClientInitialized = true;
@@ -3036,6 +4052,8 @@ void setup()
     setSemaphore(LED_BLINK_SLOW, LED_GREEN);
     print_line("Wifi OK!", 0, 0); // TODO: implement timeout
     
+    clean_screen_text();
+    
     // Usar buffers fixos para credenciais
     char ra_user[64];
     char ra_pass[128];
@@ -3081,7 +4099,7 @@ void setup()
   delay(250);                   // make sure pico restarted
   Serial.print(token_and_user); // debug
   Serial0.print(token_and_user);  
-  state = STATE_IDENTIFY_CARTRIDGE;
+  state = STATE_IDENTIFY_CARTRIDGE;  // Boot flow same as Odelot 1.1: WiFi->RA->read cartridge
 
   // modem sleep
   WiFi.setSleep(true);
@@ -3100,6 +4118,13 @@ void setup()
 // arduino-esp32 main loop
 void loop()
 {
+  // Security lockout: Everdrive disconnected from bridge/ESP 15s - bus off, ignore all Pico input
+  if (state == STATE_SECURITY_LOCKOUT || security_lockout_active) {
+    digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_DISABLE_BUS);
+    while (Serial0.available()) Serial0.read();  // Drain and ignore Pico - ready for shutdown
+    yield();
+    return;
+  }
 
 #ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
   if (websocket_initialized && ws != nullptr) {
@@ -3128,14 +4153,23 @@ void loop()
     go_back_to_title_screen = false;
     if (fifo_is_empty(&achievements_fifo))
     {
-      
       show_title_screen();
+      if (everdrive_mode) state = STATE_IDLE;  // Ensure back in idle after achievements, Everdrive only
     }
   }
 
   // handle errors during the cartridge identification - unified error handling
   if (isErrorState(state))
   {
+    // Everdrive mode: RA connectivity failures should NOT force "turn off console".
+    // The game is already running and temporary WiFi/RA outages can happen.
+    // Keep Odelot's non-Everdrive behavior unchanged by gating on everdrive_mode.
+    if (everdrive_mode) {
+      Serial.print(F("[Everdrive] Non-fatal error state: "));
+      Serial.println(getStateErrorMessage(state));
+      // Clear error and continue gameplay/bridge watchdog.
+      state = STATE_IDLE;
+    } else {
     setSemaphore(LED_BLINK_FAST, LED_RED);
     const char* errorMsg = getStateErrorMessage(state);
     print_line(errorMsg, 1, 2);
@@ -3147,9 +4181,51 @@ void loop()
     print_line("Turn off the console", 4, 2);
     play_error_sound();
     state = STATE_IDLE; // do nothing - it will not enable the BUS, so the game will not boot
+    }
   }
 
-  // handle the cartridge identification
+  // Bridge (Everdrive): only process USB when Pico already detected Everdrive (STATE_EVERDRIVE_WAIT_GAME).
+  // Always get CRC from Pico first; never let bridge skip READ_CRC / Odelot's code path.
+  if (state == STATE_EVERDRIVE_WAIT_GAME && Serial.available() > 0) {
+    size_t space = SERIAL_USB_BUFFER_SIZE - serial_usb_buffer_len - 1;
+    if (space > 0) {
+      size_t n = Serial.readBytes(serial_usb_buffer + serial_usb_buffer_len, space);
+      serial_usb_buffer_len += n;
+      serial_usb_buffer[serial_usb_buffer_len] = '\0';
+    }
+    if (serial_usb_buffer_len < SERIAL_USB_BUFFER_SIZE - 1) {
+      int crlf = find_crlf(serial_usb_buffer, serial_usb_buffer_len);
+      if (crlf >= 0) {
+        size_t len = (size_t)crlf;
+        if (starts_with(serial_usb_buffer, len, "EVERDRIVE_READY")) {
+          Serial.println(F("EVERDRIVE_READY - waiting for game from bridge"));
+          state = STATE_EVERDRIVE_WAIT_GAME;
+          digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_ENABLE_BUS);
+          Serial.println(F("READY_FOR_CRC"));
+          print_line("Everdrive: run bridge, pick game", 1, 0);
+          print_line("Send to adapter, then RESET", 2, 1);
+        }
+        else if (starts_with(serial_usb_buffer, len, "SELECT_GAME_CRC=")) {
+          handle_select_game_crc_command(serial_usb_buffer + 15, len - 15);
+        }
+        else if (starts_with(serial_usb_buffer, len, "SELECT_GAME=")) {
+          handle_select_game_command(serial_usb_buffer + 12, len - 12);
+        }
+        size_t remove = (size_t)(crlf + 2);
+        if (remove < serial_usb_buffer_len) {
+          memmove(serial_usb_buffer, serial_usb_buffer + remove, serial_usb_buffer_len - remove);
+          serial_usb_buffer_len -= remove;
+        } else {
+          serial_usb_buffer_len = 0;
+        }
+        serial_usb_buffer[serial_usb_buffer_len] = '\0';
+      }
+    } else {
+      serial_usb_buffer_len = 0;
+    }
+  }
+
+  // handle the cartridge identification (boot flow: WiFi->RA->READ_CRC, same as Odelot 1.1)
   if (state == STATE_IDENTIFY_CARTRIDGE)
   {
     setSemaphore(LED_BLINK_FAST, LED_GREEN);
@@ -3181,18 +4257,65 @@ void loop()
     show_achievement(achievement);
   }
 
-  // handle the serial communication with the pico - usando buffer fixo
+  // Everdrive mode: bus OPEN, poll bridge for game. Show instructions ONLY ONCE until reboot.
+  // After ESP receives game from bridge (SELECT_GAME_CRC), everdrive_game_received_this_session = true - never show again.
+  {
+    static unsigned long lastBridgePoll = 0;
+    static DeviceState lastEverdriveState = STATE_UNINITIALIZED;
+    if (state == STATE_EVERDRIVE_WAIT_GAME) {
+      digitalWrite(ANALOG_SWITCH_PIN, ANALOG_SWITCH_ENABLE_BUS);
+      if (lastEverdriveState != STATE_EVERDRIVE_WAIT_GAME && !everdrive_game_received_this_session) {
+        lastEverdriveState = STATE_EVERDRIVE_WAIT_GAME;
+        // Everdrive TFT UX (white text on black box)
+        ensure_black_text_box();
+        clean_screen_text();
+        if (everdrive_waiting_for_initial_reset) {
+          print_line("RESET CONSOLE", 2, -1);
+          print_line("to open Everdrive menu", 3, -1);
+        } else {
+          print_line("Choose Your Game", 1, -1);
+          print_line("Run RA Bridge (PC)", 2, -1);
+          print_line("Auto-detect enabled", 3, -1);
+        }
+      } else if (lastEverdriveState != STATE_EVERDRIVE_WAIT_GAME) {
+        lastEverdriveState = STATE_EVERDRIVE_WAIT_GAME;  // Track state without overwriting (e.g. disconnect message)
+      }
+      // If Pico never reports NES_RESETED, auto-advance after a short timeout so user isn't stuck.
+      // This does NOT arm security; it just changes the instruction screen.
+      if (everdrive_waiting_for_initial_reset && everdrive_wait_reset_started_ms > 0 && (millis() - everdrive_wait_reset_started_ms) > 4000) {
+        everdrive_waiting_for_initial_reset = false;
+        ensure_black_text_box();
+        clean_screen_text();
+        print_line("Choose Your Game", 1, -1);
+        print_line("Run RA Bridge (PC)", 2, -1);
+        print_line("Auto-detect enabled", 3, -1);
+        Serial.println(F("[Everdrive] Auto-advance: no NES_RESETED from Pico (timeout)"));
+      }
+      // If Pico never sends NES_RESETED, don't hang silently.
+      // We can still poll the bridge so plug-and-play auto-detect works even if reset signal is missed.
+      static unsigned long lastEverdriveResetWaitLog = 0;
+      if (everdrive_waiting_for_initial_reset && (millis() - lastEverdriveResetWaitLog > 5000)) {
+        lastEverdriveResetWaitLog = millis();
+        Serial.println(F("[Everdrive] Waiting for NES_RESETED from Pico (to confirm menu/reset)."));
+      }
+      if (millis() - lastBridgePoll >= EVERDRIVE_BRIDGE_POLL_INTERVAL_MS) {
+        lastBridgePoll = millis();
+        poll_bridge_for_game();
+      }
+    } else {
+      lastEverdriveState = state;  // Reset so we show instructions when we re-enter
+    }
+  }
+
+  // Process Pico serial first so achievements take priority over status poll
   while (Serial0.available() > 0)
   {
-    // Read only up to available space
     size_t available_space = SERIAL_BUFFER_SIZE - serial_buffer_len - 1;
     if (available_space > 0) {
       size_t bytes_read = Serial0.readBytes(serial_buffer + serial_buffer_len, available_space);
       serial_buffer_len += bytes_read;
-      serial_buffer[serial_buffer_len] = '\0'; // null-terminate
+      serial_buffer[serial_buffer_len] = '\0';
     }
-    
-    // Check for overflow
     if (serial_buffer_len >= SERIAL_BUFFER_SIZE - 1)
     {
       serial_buffer_len = 0;
@@ -3201,15 +4324,10 @@ void loop()
       Serial.print(F("BUFFER_OVERFLOW\r\n"));
       continue;
     }
-
-    // Process complete commands (terminated by \r\n)
     int crlf_pos;
     while ((crlf_pos = find_crlf(serial_buffer, serial_buffer_len)) >= 0)
     {
-      // We have a complete command
-      size_t cmd_len = crlf_pos; // does not include \r\n
-      
-      // Dispatch to the appropriate handler
+      size_t cmd_len = crlf_pos;
       if (starts_with(serial_buffer, cmd_len, "REQ=")) {
         handle_req_command(serial_buffer + 4, cmd_len - 4);
       }
@@ -3230,7 +4348,6 @@ void loop()
       }
       else if (starts_with(serial_buffer, cmd_len, "C=")) {
 #ifdef ENABLE_INTERNAL_WEB_APP_SUPPORT
-        // Create temporary String only for websocket
         char temp[256];
         size_t temp_len = min(cmd_len, sizeof(temp) - 1);
         memcpy(temp, serial_buffer, temp_len);
@@ -3252,8 +4369,6 @@ void loop()
         Serial.write(serial_buffer, cmd_len);
         Serial.println();
       }
-      
-      // Remove processed command from buffer (including \r\n)      
       size_t remove_len = crlf_pos + 2;
       if (remove_len < serial_buffer_len) {
         memmove(serial_buffer, serial_buffer + remove_len, serial_buffer_len - remove_len);
@@ -3264,5 +4379,138 @@ void loop()
       serial_buffer[serial_buffer_len] = '\0';
     }
   }
+
+  // Everdrive mode (gameplay): poll /status periodically for anti-cheat lockout.
+  // Uses abortable poll - cancels HTTP if achievement (A=) arrives so we can process it immediately.
+  // Grace period: wait a short time after entering gameplay to avoid false disconnect right after game loads.
+  static bool idleTimestampSet = false;
+  static unsigned long idleEnteredAt = 0;
+  // Everdrive anti-cheat watchdog: only while gameplay is active (armed after NES_RESETED)
+  if ((state == STATE_IDLE || state == STATE_WATCHING) && everdrive_mode && everdrive_security_armed) {
+    static unsigned long lastStatusPoll = 0;
+    static bool watchdogBannerPrinted = false;
+    static uint8_t bridgeOfflineStrikes = 0;
+    static uint8_t everdriveOfflineStrikes = 0;
+    static uint8_t consecutiveMisses = 0;
+    static unsigned long lastPollDurationMs = 0;
+    static uint8_t gameChangeMismatches = 0;
+    if (!idleTimestampSet) {
+      idleEnteredAt = millis();
+      idleTimestampSet = true;
+      // Ensure we have a baseline for offline timing.
+      if (everdrive_last_good_ms == 0) everdrive_last_good_ms = millis();
+      watchdogBannerPrinted = false;
+      bridgeOfflineStrikes = 0;
+      everdriveOfflineStrikes = 0;
+      consecutiveMisses = 0;
+      lastPollDurationMs = 0;
+      gameChangeMismatches = 0;
+    }
+    if (!watchdogBannerPrinted) {
+      watchdogBannerPrinted = true;
+      // Disable WiFi power save while anti-cheat is active (prevents intermittent bridge timeouts).
+      WiFi.setSleep(false);
+      esp_wifi_set_ps(WIFI_PS_NONE);
+      Serial.println(F("[BridgeWD] Everdrive watchdog active"));
+      Serial.print(F("[BridgeWD] host="));
+      Serial.print(EVERDRIVE_BRIDGE_HOST);
+      Serial.print(F(" poll_ms="));
+      Serial.print(EVERDRIVE_BRIDGE_STATUS_POLL_MS);
+      Serial.print(F(" grace_ms="));
+      Serial.print(EVERDRIVE_DISCONNECT_GRACE_MS);
+      Serial.print(F(" lockout_ms="));
+      Serial.println(EVERDRIVE_LOCKOUT_AFTER_MS);
+    }
+    unsigned long idleDuration = millis() - idleEnteredAt;
+    bool pastGracePeriod = (idleDuration >= EVERDRIVE_DISCONNECT_GRACE_MS);
+    if (pastGracePeriod && (status_check_pending || millis() - lastStatusPoll >= EVERDRIVE_BRIDGE_STATUS_POLL_MS)) {
+      lastStatusPoll = millis();
+      status_check_pending = false;
+      // If RA connectivity is currently failing, pause bridge polling until it recovers.
+      // Also pause the offline timer so we don't trigger lockout just because we intentionally stopped polling.
+      if (everdrive_pause_bridge_poll_until_ms != 0 && millis() < everdrive_pause_bridge_poll_until_ms) {
+        everdrive_last_good_ms = millis();
+        Serial.print(F("[BridgeWD] bridge poll paused (RA backoff) remaining_ms="));
+        Serial.println((unsigned long)(everdrive_pause_bridge_poll_until_ms - millis()));
+        // Skip this poll cycle.
+        goto watchdog_end;
+      }
+      unsigned long pollStart = millis();
+      int status = poll_bridge_status_abortable();
+      lastPollDurationMs = millis() - pollStart;
+      if (status == -2) {
+        // Aborted - achievement incoming, skip disconnect handling; serial will be processed below
+        Serial.println(F("[BridgeWD] poll aborted (achievement incoming)"));
+      } else if (status == 9) {
+        // Bridge explicitly requested lockout (reason in bridge_lockout_reason)
+        enter_security_lockout(bridge_lockout_reason[0] ? bridge_lockout_reason : "bridge_lockout");
+      } else if (status == 2) {
+        // Good status -> refresh watchdog timer
+        everdrive_bridge_trusted = true;
+        everdrive_last_good_ms = millis();
+        bridgeOfflineStrikes = 0;
+        everdriveOfflineStrikes = 0;
+        consecutiveMisses = 0;
+        Serial.println(F("[BridgeWD] status=OK (timer reset)"));
+
+        // Everdrive: optional "active_crc" mismatch detection (start small: warn; optionally enforce).
+        if (everdrive_expected_crc_pair[0] && bridge_active_crc_pair[0] && !bridge_active_crc_in_menu) {
+          if (strcmp(everdrive_expected_crc_pair, bridge_active_crc_pair) != 0) {
+            gameChangeMismatches++;
+            Serial.print(F("[BridgeWD] WARNING game change detected expected="));
+            Serial.print(everdrive_expected_crc_pair);
+            Serial.print(F(" active="));
+            Serial.print(bridge_active_crc_pair);
+            Serial.print(F(" mismatches="));
+            Serial.println(gameChangeMismatches);
+#if EVERDRIVE_ENFORCE_GAME_CHANGE_LOCKOUT
+            // Require 2 consecutive mismatches to avoid false positives from transient CRC reads.
+            if (gameChangeMismatches >= 2) {
+              enter_security_lockout("game_changed");
+            }
+#endif
+          } else {
+            gameChangeMismatches = 0;
+          }
+        }
+      } else if (status == 3) {
+        // Cheats not ok = immediate lockout once gameplay is armed
+        enter_security_lockout("cheats_or_savestates");
+      } else {
+        // Not OK (bridge unreachable OR everdrive_connected false).
+        // Lockout rule (Everdrive): consecutive failed polls across ~25s worth of polling attempts.
+        // This avoids a separate wall-clock timer that can trip when polls are intentionally paused/blocked.
+        consecutiveMisses++;
+        if (status == 0) bridgeOfflineStrikes++;
+        else if (status == 1) everdriveOfflineStrikes++;
+
+        // Effective period between polls is at least EVERDRIVE_BRIDGE_STATUS_POLL_MS, but can be longer if
+        // the poll itself blocks (connect/read timeouts). Use the max so "polls in 25s" matches reality.
+        unsigned long effectivePeriodMs = EVERDRIVE_BRIDGE_STATUS_POLL_MS;
+        if (lastPollDurationMs > effectivePeriodMs) effectivePeriodMs = lastPollDurationMs;
+        uint8_t requiredMisses = (uint8_t)((EVERDRIVE_LOCKOUT_AFTER_MS + effectivePeriodMs - 1) / effectivePeriodMs);
+        if (requiredMisses < 1) requiredMisses = 1;
+
+        Serial.print(F("[BridgeWD] status="));
+        Serial.print(status == 0 ? F("BRIDGE_OFFLINE") : F("EVERDRIVE_OFFLINE"));
+        Serial.print(F(" misses="));
+        Serial.print(consecutiveMisses);
+        Serial.print(F("/"));
+        Serial.print(requiredMisses);
+        Serial.print(F(" poll_dur_ms="));
+        Serial.print(lastPollDurationMs);
+        Serial.print(F(" poll_ms="));
+        Serial.println((unsigned long)EVERDRIVE_BRIDGE_STATUS_POLL_MS);
+
+        if (consecutiveMisses >= requiredMisses) {
+          enter_security_lockout(status == 0 ? "bridge_offline_polls" : "everdrive_offline_polls");
+        }
+      }
+    }
+  } else if (state != STATE_IDLE && state != STATE_WATCHING) {
+    idleTimestampSet = false;  // Reset so grace period applies when we re-enter gameplay
+  }
+
+watchdog_end:
   yield();
 }
